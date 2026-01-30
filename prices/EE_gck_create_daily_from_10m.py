@@ -23,6 +23,13 @@ BOOTSTRAP_BACKFILL_DAYS  = int(os.getenv("BOOTSTRAP_BACKFILL_DAYS", "7"))
 MAX_CATCHUP_DAYS         = min(int(os.getenv("MAX_CATCHUP_DAYS", "7")), 7)
 WATERMARK_SCAN_LIMIT     = 12
 
+# Aggregate safety: skip writing aggregates if too few coins contributed.
+_DEFAULT_AGG_MIN = max(1, int(round(TOP_N * 0.7))) if TOP_N > 0 else 0
+AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", str(_DEFAULT_AGG_MIN)))
+if AGG_MIN_COINS < 0:
+    AGG_MIN_COINS = 0
+AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
+
 TEN_MIN_TABLE       = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 DAILY_TABLE         = os.getenv("DAILY_TABLE", "gecko_candles_daily_contin")
 TABLE_LIVE          = os.getenv("TABLE_LIVE", "gecko_prices_live")
@@ -148,6 +155,12 @@ INS_MCAP_DAILY = session.prepare(f"""
   VALUES (?, ?, ?, ?, ?, ?)
 """)
 
+SEL_MCAP_DAILY_PREV = session.prepare(f"""
+  SELECT date, market_cap, volume_24h, last_updated, market_cap_rank
+  FROM {TABLE_MCAP_DAILY}
+  WHERE category=? AND date<? LIMIT 1
+""")
+
 
 def make_bucket() -> Dict[str, Any]:
     return {
@@ -232,6 +245,27 @@ def update_bucket(bucket: Dict[str, Any], row_ts: datetime, row) -> None:
     update_last_non_null(bucket, "circ", "circ_ts", sanitize_num(getattr(row, "circulating_supply", None)), row_ts)
     update_last_non_null(bucket, "tot",  "tot_ts",  sanitize_num(getattr(row, "total_supply", None)), row_ts)
 
+def read_prev_mcap(category: str, day_key: date):
+    try:
+        row = session.execute(
+            SEL_MCAP_DAILY_PREV,
+            [category, day_key],
+            timeout=REQUEST_TIMEOUT
+        ).one()
+    except Exception as e:
+        if VERBOSE_MODE:
+            print(f"[{now_str()}] [carry][WARN] prev mcap read failed {category} < {day_key}: {e}")
+        return None
+    if not row:
+        return None
+    lu = ensure_aware_utc(getattr(row, "last_updated", None)) or (day_bounds_utc(day_key)[0] - timedelta(seconds=1))
+    return {
+        "market_cap": float(getattr(row, "market_cap", 0.0) or 0.0),
+        "volume_24h": float(getattr(row, "volume_24h", 0.0) or 0.0),
+        "last_updated": lu,
+        "market_cap_rank": getattr(row, "market_cap_rank", None),
+    }
+
 
 def iter_days(start: date, end: date):
     d = start
@@ -285,6 +319,10 @@ def main():
     print(f"[{now_str()}] Processing top {len(coins)} coins (TOP_N={TOP_N})")
 
     day_totals: Dict[Tuple[date, str], Dict[str, Any]] = {}
+    day_coin_counts: Dict[date, int] = {}
+    categories_seen: set[str] = set()
+    carry_forward_days: set[date] = set()
+    carry_forward_all: Dict[date, Dict[str, Any]] = {}
 
     def bump_day_total(day_key: date, category: str, mcap_value, vol_value, last_upd: datetime) -> None:
         key = (day_key, category)
@@ -294,10 +332,14 @@ def main():
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
             entry["last_updated"] = last_upd
 
+    def bump_day_count(day_key: date) -> None:
+        day_coin_counts[day_key] = day_coin_counts.get(day_key, 0) + 1
+
     wrote = skipped = empty = errors = unchanged = 0
 
     for idx, c in enumerate(coins, 1):
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
+        categories_seen.add(coin_category)
         if idx == 1 or idx % PROGRESS_EVERY == 0 or idx == len(coins):
             print(
                 f"[{now_str()}] -> Coin {idx}/{len(coins)}: {getattr(c,'symbol','?')} "
@@ -371,14 +413,15 @@ def main():
                     print(f"[{now_str()}] [EXIST-ERR] {c.symbol} {d}: {e}")
                 return None
 
-        def aggregate_existing(d: date) -> None:
-            existing = get_existing(d)
-            if existing:
-                mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-                vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-                last_upd = existing_last_upd_cache.get(d) or (day_bounds_utc(d)[1] - timedelta(seconds=1))
-                bump_day_total(d, coin_category, mcap_exist, vol_exist, last_upd)
-                bump_day_total(d, 'ALL', mcap_exist, vol_exist, last_upd)
+    def aggregate_existing(d: date) -> None:
+        existing = get_existing(d)
+        if existing:
+            mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+            vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+            last_upd = existing_last_upd_cache.get(d) or (day_bounds_utc(d)[1] - timedelta(seconds=1))
+            bump_day_total(d, coin_category, mcap_exist, vol_exist, last_upd)
+            bump_day_total(d, 'ALL', mcap_exist, vol_exist, last_upd)
+            bump_day_count(d)
 
         for d in final_days:
             bucket = buckets.get(d)
@@ -455,6 +498,7 @@ def main():
                 )
                 bump_day_total(d, coin_category, mcap, vol, last_upd)
                 bump_day_total(d, 'ALL', mcap, vol, last_upd)
+                bump_day_count(d)
                 wrote += 1
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
@@ -536,6 +580,7 @@ def main():
                 )
                 bump_day_total(d, coin_category, mcap, vol, last_upd)
                 bump_day_total(d, 'ALL', mcap, vol, last_upd)
+                bump_day_count(d)
                 wrote += 1
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
@@ -546,9 +591,40 @@ def main():
 
     if WRITE_MCAP_DAILY and day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
+        if AGG_MIN_COINS:
+            print(f"[{now_str()}] [mcap-daily] agg_min_coins={AGG_MIN_COINS}")
+
+        # Carry-forward for low-coverage days (avoid partial totals)
+        if AGG_CARRY_FORWARD and AGG_MIN_COINS:
+            for day_key, count in list(day_coin_counts.items()):
+                if count >= AGG_MIN_COINS:
+                    continue
+                carry_catmap: Dict[str, Any] = {}
+                for category in sorted(categories_seen.union({"ALL"})):
+                    prev = read_prev_mcap(category, day_key)
+                    if prev:
+                        day_totals[(day_key, category)] = {
+                            "market_cap": prev["market_cap"],
+                            "volume_24h": prev["volume_24h"],
+                            "last_updated": prev["last_updated"],
+                            "market_cap_rank": prev.get("market_cap_rank"),
+                        }
+                        carry_catmap[category] = prev
+                        if category == "ALL":
+                            carry_forward_all[day_key] = prev
+                if "ALL" in carry_catmap:
+                    carry_forward_days.add(day_key)
 
         # Rebuild ALL from categories before ranking/writing.
         day_totals = rebuild_all_from_categories(day_totals)
+        # Restore ALL for carry-forward days (do not recompute from partial categories)
+        for day_key, prev in carry_forward_all.items():
+            day_totals[(day_key, "ALL")] = {
+                "market_cap": prev["market_cap"],
+                "volume_24h": prev["volume_24h"],
+                "last_updated": prev["last_updated"],
+                "market_cap_rank": prev.get("market_cap_rank"),
+            }
 
         # Compute ranks per day (ALL=0; categories ranked by total mcap DESC)
         day_caps: dict[date, list[tuple[str, float]]] = {}
@@ -564,9 +640,19 @@ def main():
             rank_map[(dkey, 'ALL')] = 0
 
         agg_written = 0
+        allowed_days = set()
+        if AGG_MIN_COINS:
+            for day_key, count in day_coin_counts.items():
+                if count >= AGG_MIN_COINS or day_key in carry_forward_days:
+                    allowed_days.add(day_key)
+        else:
+            allowed_days = set(day_caps.keys())
+
         for (day_key, category), totals in sorted(
             day_totals.items(), key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
         ):
+            if AGG_MIN_COINS and day_key not in allowed_days:
+                continue
             day_end = day_bounds_utc(day_key)[1]
             last_upd = totals.get('last_updated') or (day_end - timedelta(seconds=1))
             rank_value = rank_map.get((day_key, category))

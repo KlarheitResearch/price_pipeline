@@ -181,6 +181,8 @@ jobs:
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           SLOTS_BACKFILL: "4"
+          AGG_MIN_COINS: "200"
+          AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/CC_gck_append_10m_from_live.py
 
@@ -203,7 +205,10 @@ jobs:
           GAPFILL_HOURS: "12"
           GAPFILL_LOCK_ENABLED: "1"
           GAPFILL_LOCK_JOB: "append_10m_gapfill"
-          GAPFILL_WRITE_AGG: "0"
+          GAPFILL_WRITE_AGG: "1"
+          REBUILD_AGG_AFTER_GAPFILL: "1"
+          AGG_MIN_COINS: "200"
+          AGG_CARRY_FORWARD: "1"
 
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: python prices/CC_gck_append_10m_from_live.py

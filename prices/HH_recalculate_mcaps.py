@@ -60,6 +60,11 @@ CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "50"))
 
+# Aggregate safety: abort rebuild if too few live IDs (avoid truncating with partial data)
+AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", "200"))
+if AGG_MIN_COINS < 0:
+    AGG_MIN_COINS = 0
+
 CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
 
 NOW_UTC       = datetime.now(timezone.utc)
@@ -346,7 +351,13 @@ def main():
           f"daily[{WIN_D_START} -> {WIN_D_END})")
 
     ids_live = [r.id for r in session.execute(SEL_IDS_LIVE, timeout=REQUEST_TIMEOUT_SEC)]
-    print(f"[{now_str()}] IDs from gecko_prices_live: {len(ids_live)}")
+    print(f"[{now_str()}] IDs from gecko_prices_live: {len(ids_live)} (agg_min_coins={AGG_MIN_COINS})")
+    if AGG_MIN_COINS and len(ids_live) < AGG_MIN_COINS:
+        print(
+            f"[{now_str()}] [ABORT] live IDs below minimum: {len(ids_live)} < {AGG_MIN_COINS} "
+            f"(skip truncate/rebuild for safety)"
+        )
+        return
 
     t0 = time.time()
     acc_10m, acc_hourly, acc_daily = aggregate_for_ids(ids_live)

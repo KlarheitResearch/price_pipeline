@@ -155,6 +155,8 @@ jobs:
           FINALIZE_PREV: "1"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
+          AGG_MIN_COINS: "200"
+          AGG_CARRY_FORWARD: "1"
         run: python prices/DD_gck_create_hourly_from_10m.py
 
       - name: 04 Update/close daily from 10m
@@ -174,7 +176,9 @@ jobs:
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-          WRITE_MCAP_DAILY: "0"
+          WRITE_MCAP_DAILY: "1"
+          AGG_MIN_COINS: "200"
+          AGG_CARRY_FORWARD: "1"
         run: python prices/EE_gck_create_daily_from_10m.py
 
       - name: 05 Update monthly from daily/live

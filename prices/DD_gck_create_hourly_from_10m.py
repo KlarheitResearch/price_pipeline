@@ -53,6 +53,13 @@ MAX_CATCHUP_HOURS        = int(os.getenv("MAX_CATCHUP_HOURS", "48"))
 WRITE_CONCURRENCY        = int(os.getenv("WRITE_CONCURRENCY", "32"))
 WATERMARK_SCAN_LIMIT     = 12
 
+# Aggregate safety: skip writing aggregates if too few coins contributed.
+_DEFAULT_AGG_MIN = max(1, int(round(TOP_N * 0.7))) if TOP_N > 0 else 0
+AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", str(_DEFAULT_AGG_MIN)))
+if AGG_MIN_COINS < 0:
+    AGG_MIN_COINS = 0
+AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
+
 # Table names (Gecko pipeline)
 TEN_MIN_TABLE           = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 HOURLY_TABLE            = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
@@ -204,6 +211,11 @@ def main():
         (category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
       VALUES (?, ?, ?, ?, ?, ?)
     """)
+    SEL_MCAP_HOURLY_PREV = session.prepare(f"""
+      SELECT ts, market_cap, volume_24h, last_updated, market_cap_rank
+      FROM {TABLE_MCAP_HOURLY}
+      WHERE category=? AND ts<? LIMIT 1
+    """)
     print(f"[{now_str()}] Prepared in {time.time()-t0:.2f}s")
 
     # Time anchors
@@ -229,6 +241,10 @@ def main():
 
     # Aggregation buckets
     hour_totals: Dict[Tuple[datetime, str], Dict[str, Any]] = {}
+    hour_coin_counts: Dict[datetime, int] = {}
+    categories_seen: set[str] = set()
+    carry_forward_slots: set[datetime] = set()
+    carry_forward_all: Dict[datetime, Dict[str, Any]] = {}
 
     def bump_hour_total(slot_start: datetime, category: str, mcap_value, vol_value, last_upd: datetime) -> None:
         """Sum into (ts, category). slot_start & last_upd are aware UTC."""
@@ -241,6 +257,9 @@ def main():
         entry["volume_24h"] += float(vol_value or 0.0)
         if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
             entry["last_updated"] = last_upd
+
+    def bump_hour_count(slot_start: datetime) -> None:
+        hour_coin_counts[slot_start] = hour_coin_counts.get(slot_start, 0) + 1
 
     wrote = skipped = empty = errors = finalized_skips = unchanged_skips = 0
 
@@ -301,6 +320,26 @@ def main():
         update_last_non_null(bucket, "circ", "circ_ts", sanitize_num(getattr(row, "circulating_supply", None)), row_ts)
         update_last_non_null(bucket, "tot",  "tot_ts",  sanitize_num(getattr(row, "total_supply", None)), row_ts)
 
+    def read_prev_mcap(category: str, slot_start: datetime):
+        try:
+            row = session.execute(
+                SEL_MCAP_HOURLY_PREV,
+                [category, to_cassandra_ts(slot_start)],
+                timeout=REQUEST_TIMEOUT
+            ).one()
+        except Exception as e:
+            vprint(f"[{now_str()}] [carry][WARN] prev mcap read failed {category} < {slot_start}: {e}")
+            return None
+        if not row:
+            return None
+        lu = ensure_aware_utc(getattr(row, "last_updated", None)) or (slot_start - timedelta(seconds=1))
+        return {
+            "market_cap": float(getattr(row, "market_cap", 0.0) or 0.0),
+            "volume_24h": float(getattr(row, "volume_24h", 0.0) or 0.0),
+            "last_updated": lu,
+            "market_cap_rank": getattr(row, "market_cap_rank", None),
+        }
+
     def get_latest_final_ts(coin_id):
         try:
             row = session.execute(SEL_HOURLY_LATEST.bind([coin_id]), timeout=REQUEST_TIMEOUT).one()
@@ -323,6 +362,7 @@ def main():
             print(f"[{now_str()}] → Coin {ci}/{len(coins)}: {getattr(c,'symbol','?')} ({getattr(c,'id','?')}) r={getattr(c,'market_cap_rank','?')}")
 
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
+        categories_seen.add(coin_category)
 
         watermark_ts = get_latest_final_ts(c.id)
         if watermark_ts:
@@ -433,6 +473,7 @@ def main():
                     last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                     bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
                     bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
+                    bump_hour_count(start)
                 skipped += 1
                 continue
 
@@ -446,6 +487,7 @@ def main():
                         last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                         bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
                         bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
+                        bump_hour_count(start)
                     empty += 1
                     vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty (no 10m & no prev) → aggregate existing if present; skip write")
                     continue
@@ -460,6 +502,7 @@ def main():
                     last_upd   = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                     bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd)
                     bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd)
+                    bump_hour_count(start)
                 empty += 1
                 kind = "final hour" if is_final else "partial hour"
                 vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} empty ({kind}) → aggregate existing if present; skip write")
@@ -513,6 +556,7 @@ def main():
                         last_upd_e = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                         bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
                         bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
+                        bump_hour_count(start)
                         finalized_skips += 1
                         vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} already final & identical → aggregate existing; skip write")
                         continue
@@ -537,6 +581,7 @@ def main():
                         last_upd_e = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
                         bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
                         bump_hour_total(start, 'ALL',        mcap_exist, vol_exist, last_upd_e)
+                        bump_hour_count(start)
                         unchanged_skips += 1
                         vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} partial unchanged → aggregate existing; skip write")
                         continue
@@ -579,6 +624,7 @@ def main():
                 if success:
                     bump_hour_total(meta["start"], meta["category"], meta["mcap"], meta["vol"], meta["last_upd"])
                     bump_hour_total(meta["start"], 'ALL',        meta["mcap"], meta["vol"], meta["last_upd"])
+                    bump_hour_count(meta["start"])
                     vprint(
                         f"[{now_str()}]    UPSERT {meta['symbol']} {meta['start'].isoformat()} ({meta['candle_source']}) "
                         f"O={meta['o']} H={meta['h']} L={meta['l']} C={meta['cl']} M={meta['mcap']} V={meta['vol']} "
@@ -593,9 +639,40 @@ def main():
     # Write category aggregates
     if hour_totals:
         print(f"[{now_str()}] [mcap-hourly] writing {len(hour_totals)} aggregates into {TABLE_MCAP_HOURLY}")
+        if AGG_MIN_COINS:
+            print(f"[{now_str()}] [mcap-hourly] agg_min_coins={AGG_MIN_COINS}")
+
+        # Carry-forward for low-coverage slots (avoid partial totals)
+        if AGG_CARRY_FORWARD and AGG_MIN_COINS:
+            for slot_start, count in list(hour_coin_counts.items()):
+                if count >= AGG_MIN_COINS:
+                    continue
+                carry_catmap: Dict[str, Any] = {}
+                for category in sorted(categories_seen.union({"ALL"})):
+                    prev = read_prev_mcap(category, slot_start)
+                    if prev:
+                        hour_totals[(slot_start, category)] = {
+                            "market_cap": prev["market_cap"],
+                            "volume_24h": prev["volume_24h"],
+                            "last_updated": prev["last_updated"],
+                            "market_cap_rank": prev.get("market_cap_rank"),
+                        }
+                        carry_catmap[category] = prev
+                        if category == "ALL":
+                            carry_forward_all[slot_start] = prev
+                if "ALL" in carry_catmap:
+                    carry_forward_slots.add(slot_start)
 
         # Rebuild ALL from category buckets to avoid stale/partial ALL.
         hour_totals = rebuild_all_from_categories(hour_totals)
+        # Restore ALL for carry-forward slots (do not recompute from partial categories)
+        for slot_start, prev in carry_forward_all.items():
+            hour_totals[(slot_start, "ALL")] = {
+                "market_cap": prev["market_cap"],
+                "volume_24h": prev["volume_24h"],
+                "last_updated": prev["last_updated"],
+                "market_cap_rank": prev.get("market_cap_rank"),
+            }
 
         # Compute ranks per slot (ALL = 0; categories ranked by total mcap DESC)
         slot_caps = defaultdict(list)  # slot_start -> [(category, mcap_sum)]
@@ -614,10 +691,21 @@ def main():
         agg_written = 0
         agg_args: List[List[Any]] = []
         agg_meta: List[Dict[str, Any]] = []
+        allowed_slots = set()
+        if AGG_MIN_COINS:
+            for slot_start, count in hour_coin_counts.items():
+                if count >= AGG_MIN_COINS or slot_start in carry_forward_slots:
+                    allowed_slots.add(slot_start)
+        else:
+            allowed_slots = set(slot_caps.keys())
+
         for (slot_start, category), totals in sorted(
             hour_totals.items(),
             key=lambda kv: (kv[0][0], 0 if kv[0][1] == 'ALL' else 1, kv[0][1].lower())
         ):
+            if AGG_MIN_COINS and slot_start not in allowed_slots:
+                continue
+
             last_upd = totals.get('last_updated') or (slot_start + timedelta(hours=1) - timedelta(seconds=1))
             rank_value = rank_map.get((slot_start, category))  # None if unseen → leave null
 

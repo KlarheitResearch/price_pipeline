@@ -46,6 +46,17 @@ GAPFILL_LOCK_JOB     = os.getenv("GAPFILL_LOCK_JOB", "append_10m_gapfill").strip
 # If 0 (default), do NOT write category aggregates in gapfill mode (avoids incorrect partial totals).
 GAPFILL_WRITE_AGG    = os.getenv("GAPFILL_WRITE_AGG", "0") == "1"
 
+# Aggregate safety: skip writing aggregates if too few coins contributed.
+_DEFAULT_AGG_MIN = max(1, int(round(TOP_N * 0.7))) if TOP_N > 0 else 0
+AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", str(_DEFAULT_AGG_MIN)))
+if AGG_MIN_COINS < 0:
+    AGG_MIN_COINS = 0
+AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
+
+# Optional post-run aggregate rebuild (recompute from stored 10m rows).
+REBUILD_AGG_AFTER_GAPFILL = os.getenv("REBUILD_AGG_AFTER_GAPFILL", "0") == "1"
+REBUILD_AGG_AFTER_APPEND = os.getenv("REBUILD_AGG_AFTER_APPEND", "0") == "1"
+
 # Tables (defaults match your schema)
 TABLE_LATEST       = os.getenv("TABLE_LATEST", "gecko_prices_live")
 TABLE_ROLLING      = os.getenv("TABLE_ROLLING", "gecko_prices_live_rolling")
@@ -155,6 +166,33 @@ SEL_10M_EXISTING_TS_RANGE_PS = session.prepare(
     """
 )
 
+# Existing 10m slot by id+ts (used to keep aggregates consistent on skipped inserts)
+SEL_10M_ONE_PS = session.prepare(
+    f"""
+    SELECT market_cap, volume_24h, last_updated
+    FROM {TABLE_OUT}
+    WHERE id=? AND ts=? LIMIT 1
+    """
+)
+
+# Read stored 10m rows for aggregate rebuilds
+SEL_10M_RANGE_FOR_AGG = session.prepare(
+    f"""
+    SELECT ts, market_cap, volume_24h, last_updated
+    FROM {TABLE_OUT}
+    WHERE id=? AND ts>=? AND ts<?
+    """
+)
+
+# Previous aggregate row (for carry-forward)
+SEL_MCAP_10M_PREV = session.prepare(
+    f"""
+    SELECT ts, market_cap, volume_24h, last_updated, market_cap_rank
+    FROM {TABLE_MCAP_OUT}
+    WHERE category=? AND ts < ? LIMIT 1
+    """
+)
+
 # Aggregates: gecko_market_cap_10m_7d(category, ts, last_updated, market_cap, market_cap_rank, volume_24h)
 INS_MCAP_10M_UPSERT = session.prepare(
     f"""
@@ -240,6 +278,99 @@ def ensure_all_bucket(catmap: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, 
     }
     return catmap
 
+def read_existing_slot(coin_id: str, slot_start: datetime, slot_end: datetime):
+    """
+    Fetch the already-stored 10m slot so aggregates always reflect persisted rows
+    (especially when INSERT IF NOT EXISTS does not apply).
+    """
+    try:
+        row = session.execute(
+            SEL_10M_ONE_PS,
+            [coin_id, slot_start],
+            timeout=REQUEST_TIMEOUT
+        ).one()
+    except Exception as e:
+        print(f"        [WARN] existing slot fetch failed {coin_id} @ {slot_start}: {e}")
+        return None
+    if not row:
+        return None
+    mcap_exist = float(row.market_cap) if row.market_cap is not None else 0.0
+    vol_exist = float(row.volume_24h) if row.volume_24h is not None else 0.0
+    lu_exist = to_utc(getattr(row, "last_updated", None)) or (slot_end - timedelta(seconds=1))
+    return mcap_exist, vol_exist, lu_exist
+
+def recompute_slot_totals_from_table(
+    target_slots: List[datetime],
+    coins: List[Any],
+    accumulate_fn,
+) -> Tuple[Dict[datetime, Dict[str, Dict[str, Any]]], Dict[datetime, int]]:
+    """
+    Recompute aggregates from stored 10m rows for a specific set of slots.
+    This is slower but ensures totals reflect what is actually persisted.
+    """
+    if not target_slots:
+        return {}, {}
+
+    target_set = set(target_slots)
+    start = min(target_slots)
+    end_excl = max(target_slots) + timedelta(minutes=SLOT_MINUTES)
+
+    rebuilt_totals: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
+    rebuilt_counts: Dict[datetime, int] = {}
+
+    for idx, c in enumerate(coins, 1):
+        if (idx == 1) or (idx % 25 == 0) or (idx == len(coins)):
+            print(f"[{now_str()}] [rebuild-agg] coin {idx}/{len(coins)}: {getattr(c, 'symbol', '?')} ({getattr(c, 'id', '?')})")
+
+        coin_id = getattr(c, "id", None)
+        if not coin_id:
+            continue
+        coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
+
+        try:
+            rows = session.execute(
+                SEL_10M_RANGE_FOR_AGG,
+                [coin_id, start, end_excl],
+                timeout=REQUEST_TIMEOUT
+            )
+        except Exception as e:
+            print(f"[{now_str()}] [rebuild-agg][WARN] read failed {coin_id}: {e}")
+            continue
+
+        for r in rows:
+            ts_raw = getattr(r, "ts", None)
+            ts = to_utc(ts_raw) if isinstance(ts_raw, datetime) else None
+            if ts is None or ts not in target_set:
+                continue
+            mcap = float(getattr(r, "market_cap", 0.0) or 0.0)
+            vol = float(getattr(r, "volume_24h", 0.0) or 0.0)
+            lu = to_utc(getattr(r, "last_updated", None)) or (ts + timedelta(minutes=SLOT_MINUTES) - timedelta(seconds=1))
+            accumulate_fn(rebuilt_totals, ts, coin_category, mcap, vol, lu)
+            accumulate_fn(rebuilt_totals, ts, "ALL", mcap, vol, lu)
+            rebuilt_counts[ts] = rebuilt_counts.get(ts, 0) + 1
+
+    return rebuilt_totals, rebuilt_counts
+
+def read_prev_mcap(category: str, slot_start: datetime):
+    try:
+        row = session.execute(
+            SEL_MCAP_10M_PREV,
+            [category, slot_start],
+            timeout=REQUEST_TIMEOUT
+        ).one()
+    except Exception as e:
+        print(f"[{now_str()}] [carry][WARN] prev mcap read failed {category} < {slot_start}: {e}")
+        return None
+    if not row:
+        return None
+    lu = to_utc(getattr(row, "last_updated", None)) or (slot_start - timedelta(seconds=1))
+    return {
+        "market_cap": float(getattr(row, "market_cap", 0.0) or 0.0),
+        "volume_24h": float(getattr(row, "volume_24h", 0.0) or 0.0),
+        "last_updated": lu,
+        "market_cap_rank": getattr(row, "market_cap_rank", None),
+    }
+
 # ───────────────────────── Main logic ─────────────────────────
 def main():
     # Decide run mode early (append is always allowed; gapfill is optional)
@@ -267,9 +398,32 @@ def main():
 
     # slot_totals[slot_start][category] = {'market_cap': float, 'volume_24h': float, 'last_updated': datetime}
     slot_totals: Dict[datetime, Dict[str, Dict[str, Any]]] = {}
+    # slot_coin_counts[slot_start] = number of coins contributing to that slot
+    slot_coin_counts: Dict[datetime, int] = {}
+    # categories encountered in this run (for carry-forward)
+    categories_seen: set[str] = set()
+    carry_forward_slots: set[datetime] = set()
 
     def bump_slot_total(slot_start: datetime, category: str, mcap_value: float, vol_value: float, last_upd: datetime) -> None:
         catmap = slot_totals.setdefault(slot_start, {})
+        entry = catmap.setdefault(category, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
+        entry["market_cap"] += float(mcap_value or 0.0)
+        entry["volume_24h"] += float(vol_value or 0.0)
+        if last_upd and (entry["last_updated"] is None or last_upd > entry["last_updated"]):
+            entry["last_updated"] = last_upd
+
+    def bump_slot_coin_count(slot_start: datetime) -> None:
+        slot_coin_counts[slot_start] = slot_coin_counts.get(slot_start, 0) + 1
+
+    def accumulate_into_map(
+        target_map: Dict[datetime, Dict[str, Dict[str, Any]]],
+        slot_start: datetime,
+        category: str,
+        mcap_value: float,
+        vol_value: float,
+        last_upd: datetime,
+    ) -> None:
+        catmap = target_map.setdefault(slot_start, {})
         entry = catmap.setdefault(category, {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": last_upd})
         entry["market_cap"] += float(mcap_value or 0.0)
         entry["volume_24h"] += float(vol_value or 0.0)
@@ -285,6 +439,7 @@ def main():
         coin_id = getattr(c, "id")
         print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({coin_id}) rank={mkr}")
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
+        categories_seen.add(coin_category)
         carry_used = 0
         # In gapfill mode, discover which 10m slots already exist for this coin in the window.
         existing_ts: set = set()
@@ -314,7 +469,17 @@ def main():
             # gapfill mode: skip if this slot already exists
             if run_mode == "gapfill":
                 if start in existing_ts:
-                    print("        exists → skip")
+                    if GAPFILL_WRITE_AGG:
+                        existing_vals = read_existing_slot(coin_id, start, end)
+                        if existing_vals:
+                            mcap_exist, vol_exist, lu_exist = existing_vals
+                            bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                            bump_slot_total(start, 'ALL', mcap_exist, vol_exist, lu_exist)
+                            bump_slot_coin_count(start)
+                        else:
+                            print("        exists -> skip (no row for agg)")
+                    else:
+                        print("        exists -> skip")
                     skipped += 1
                     continue
 
@@ -369,9 +534,24 @@ def main():
                 applied = bool(getattr(result, 'applied', True)) if result is not None else True
 
                 # accumulate aggregates only in normal append mode, OR if explicitly enabled for gapfill
-                if ((run_mode != "gapfill") or GAPFILL_WRITE_AGG) and applied:
-                    bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                    bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
+                if (run_mode != "gapfill") or GAPFILL_WRITE_AGG:
+                    if applied:
+                        bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                        bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
+                        bump_slot_coin_count(start)
+                    else:
+                        existing_vals = read_existing_slot(coin_id, start, end)
+                        if existing_vals:
+                            mcap_exist, vol_exist, lu_exist = existing_vals
+                            bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                            bump_slot_total(start, 'ALL',          mcap_exist, vol_exist, lu_exist)
+                            bump_slot_coin_count(start)
+                        else:
+                            # Fallback: avoid dropping totals if the row is unexpectedly missing.
+                            bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                            bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
+                            bump_slot_coin_count(start)
+                            print("        [WARN] insert not applied but existing row missing; aggregated computed values")
 
                 print(f"        insert {'applied' if applied else 'skipped'} "
                       f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
@@ -384,13 +564,58 @@ def main():
                 traceback.print_exc()
                 skipped += 1
 
+    # Optional aggregate rebuild from stored rows (max stability)
+    if (
+        (run_mode == "gapfill" and REBUILD_AGG_AFTER_GAPFILL)
+        or (run_mode == "append" and REBUILD_AGG_AFTER_APPEND)
+    ):
+        target_slots = [s for (s, _e) in slots]
+        if target_slots:
+            print(f"[{now_str()}] [rebuild-agg] recomputing aggregates for {len(target_slots)} slots (mode={run_mode})")
+            rebuilt_totals, rebuilt_counts = recompute_slot_totals_from_table(
+                target_slots,
+                coins,
+                accumulate_into_map,
+            )
+            slot_totals = rebuilt_totals
+            slot_coin_counts = rebuilt_counts
+            print(f"[{now_str()}] [rebuild-agg] done: slots={len(slot_totals)}")
+
+    # Carry-forward for low-coverage slots (avoid partial totals)
+    if AGG_CARRY_FORWARD and AGG_MIN_COINS:
+        for slot_start, count in list(slot_coin_counts.items()):
+            if count >= AGG_MIN_COINS:
+                continue
+            carry_catmap: Dict[str, Dict[str, Any]] = {}
+            for category in sorted(categories_seen.union({"ALL"})):
+                prev = read_prev_mcap(category, slot_start)
+                if prev:
+                    carry_catmap[category] = {
+                        "market_cap": prev["market_cap"],
+                        "volume_24h": prev["volume_24h"],
+                        "last_updated": prev["last_updated"],
+                        "market_cap_rank": prev.get("market_cap_rank"),
+                    }
+            if "ALL" not in carry_catmap:
+                continue
+            slot_totals[slot_start] = carry_catmap
+            carry_forward_slots.add(slot_start)
+
     # Write category aggregates (with ranks)
     if slot_totals and ((run_mode != "gapfill") or GAPFILL_WRITE_AGG):
         print(f"[{now_str()}] [mcap-10m] writing aggregates for {len(slot_totals)} slots into {TABLE_MCAP_OUT}")
         agg_written = 0
         for slot_start in sorted(slot_totals.keys()):
+            if AGG_MIN_COINS:
+                coin_count = slot_coin_counts.get(slot_start, 0)
+                if coin_count < AGG_MIN_COINS and slot_start not in carry_forward_slots:
+                    print(
+                        f"[{now_str()}] [mcap-10m] skip slot {slot_start} (coins={coin_count} < min={AGG_MIN_COINS})"
+                    )
+                    continue
             catmap = slot_totals[slot_start]  # Dict[str, {market_cap, volume_24h, last_updated}]
-            catmap = ensure_all_bucket(catmap)
+            if slot_start not in carry_forward_slots:
+                catmap = ensure_all_bucket(catmap)
             # compute ranks for this slot (ALL=0; others by market_cap desc)
             ranks = compute_category_ranks(catmap)
             # write in defined order: ALL first, then alphabetical for determinism
