@@ -413,16 +413,16 @@ def main():
                     print(f"[{now_str()}] [EXIST-ERR] {c.symbol} {d}: {e}")
                 return None
 
-    def aggregate_existing(d: date) -> None:
-        existing = get_existing(d)
-        if existing:
-            mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
-            vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
-            last_upd = existing_last_upd_cache.get(d) or (day_bounds_utc(d)[1] - timedelta(seconds=1))
-            bump_day_total(d, coin_category, mcap_exist, vol_exist, last_upd)
-            bump_day_total(d, 'ALL', mcap_exist, vol_exist, last_upd)
-            bump_day_count(d)
-
+        def aggregate_existing(d: date) -> None:
+            existing = get_existing(d)
+            if existing:
+                mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                last_upd = existing_last_upd_cache.get(d) or (day_bounds_utc(d)[1] - timedelta(seconds=1))
+                bump_day_total(d, coin_category, mcap_exist, vol_exist, last_upd)
+                bump_day_total(d, 'ALL', mcap_exist, vol_exist, last_upd)
+                bump_day_count(d)
+    
         for d in final_days:
             bucket = buckets.get(d)
             price_count = bucket["price_count"] if bucket else 0
@@ -516,79 +516,79 @@ def main():
                 empty += 1
                 if VERBOSE_MODE:
                     print(f"[{now_str()}]    {c.symbol} {d} empty (no 10m) -> aggregate existing; skip write")
-                continue
 
-            o = bucket["open"]
-            h = bucket["high"]
-            l = bucket["low"]
-            cl = bucket["close"]
-
-            mcap = bucket["mcap"]
-            vol = bucket["vol"]
-            rank = bucket["rank"]
-            circ = bucket["circ"]
-            tot = bucket["tot"]
-
-            existing = None
-            if mcap is None or vol is None or rank is None or circ is None or tot is None:
-                existing = get_existing(d)
-                if existing:
-                    if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
-                    if vol is None: vol = sanitize_num(getattr(existing, "volume_24h", None))
-                    if rank is None: rank = getattr(existing, "market_cap_rank", None)
-                    if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
-                    if tot is None: tot = sanitize_num(getattr(existing, "total_supply", None))
-
-            if mcap is None: mcap = 0.0
-            if vol is None: vol = 0.0
-
-            last_upd = bucket["last_updated"] or (today_end_excl - timedelta(seconds=1))
-            candle_source = "10m_partial"
-
-            existing = existing or get_existing(d)
-            if existing and getattr(existing, "candle_source", None) == "10m_partial":
-                same = all([
-                    equalish(o, getattr(existing, "open", None)),
-                    equalish(h, getattr(existing, "high", None)),
-                    equalish(l, getattr(existing, "low", None)),
-                    equalish(cl, getattr(existing, "close", None)),
-                    equalish(cl, getattr(existing, "price_usd", None)),
-                    equalish(mcap, getattr(existing, "market_cap", None)),
-                    equalish(vol, getattr(existing, "volume_24h", None)),
-                    (rank == getattr(existing, "market_cap_rank", None)),
-                    equalish(circ, getattr(existing, "circulating_supply", None)),
-                    equalish(tot, getattr(existing, "total_supply", None)),
-                ])
-                if same:
-                    aggregate_existing(d)
-                    unchanged += 1
+            else:
+                o = bucket["open"]
+                h = bucket["high"]
+                l = bucket["low"]
+                cl = bucket["close"]
+    
+                mcap = bucket["mcap"]
+                vol = bucket["vol"]
+                rank = bucket["rank"]
+                circ = bucket["circ"]
+                tot = bucket["tot"]
+    
+                existing = None
+                if mcap is None or vol is None or rank is None or circ is None or tot is None:
+                    existing = get_existing(d)
+                    if existing:
+                        if mcap is None: mcap = sanitize_num(getattr(existing, "market_cap", None))
+                        if vol is None: vol = sanitize_num(getattr(existing, "volume_24h", None))
+                        if rank is None: rank = getattr(existing, "market_cap_rank", None)
+                        if circ is None: circ = sanitize_num(getattr(existing, "circulating_supply", None))
+                        if tot is None: tot = sanitize_num(getattr(existing, "total_supply", None))
+    
+                if mcap is None: mcap = 0.0
+                if vol is None: vol = 0.0
+    
+                last_upd = bucket["last_updated"] or (today_end_excl - timedelta(seconds=1))
+                candle_source = "10m_partial"
+    
+                existing = existing or get_existing(d)
+                if existing and getattr(existing, "candle_source", None) == "10m_partial":
+                    same = all([
+                        equalish(o, getattr(existing, "open", None)),
+                        equalish(h, getattr(existing, "high", None)),
+                        equalish(l, getattr(existing, "low", None)),
+                        equalish(cl, getattr(existing, "close", None)),
+                        equalish(cl, getattr(existing, "price_usd", None)),
+                        equalish(mcap, getattr(existing, "market_cap", None)),
+                        equalish(vol, getattr(existing, "volume_24h", None)),
+                        (rank == getattr(existing, "market_cap_rank", None)),
+                        equalish(circ, getattr(existing, "circulating_supply", None)),
+                        equalish(tot, getattr(existing, "total_supply", None)),
+                    ])
+                    if same:
+                        aggregate_existing(d)
+                        unchanged += 1
+                        if VERBOSE_MODE:
+                            print(f"[{now_str()}]    {c.symbol} {d} partial unchanged -> aggregate existing; skip write")
+                        continue
+    
+                try:
+                    session.execute(
+                        INS_UPSERT,
+                        [
+                            c.id, d, c.symbol, c.name,
+                            o, h, l, cl, cl,
+                            mcap, vol,
+                            rank, circ, tot,
+                            candle_source, to_cassandra_ts(last_upd),
+                        ],
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    bump_day_total(d, coin_category, mcap, vol, last_upd)
+                    bump_day_total(d, 'ALL', mcap, vol, last_upd)
+                    bump_day_count(d)
+                    wrote += 1
                     if VERBOSE_MODE:
-                        print(f"[{now_str()}]    {c.symbol} {d} partial unchanged -> aggregate existing; skip write")
-                    continue
-
-            try:
-                session.execute(
-                    INS_UPSERT,
-                    [
-                        c.id, d, c.symbol, c.name,
-                        o, h, l, cl, cl,
-                        mcap, vol,
-                        rank, circ, tot,
-                        candle_source, to_cassandra_ts(last_upd),
-                    ],
-                    timeout=REQUEST_TIMEOUT,
-                )
-                bump_day_total(d, coin_category, mcap, vol, last_upd)
-                bump_day_total(d, 'ALL', mcap, vol, last_upd)
-                bump_day_count(d)
-                wrote += 1
-                if VERBOSE_MODE:
-                    print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
-            except Exception as e:
-                errors += 1
-                skipped += 1
-                print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {d}: {e}")
-
+                        print(f"[{now_str()}]    UPSERT {c.symbol} {d} ({candle_source})")
+                except Exception as e:
+                    errors += 1
+                    skipped += 1
+                    print(f"[{now_str()}] [WRITE-ERR] {c.symbol} {d}: {e}")
+    
     if WRITE_MCAP_DAILY and day_totals:
         print(f"[{now_str()}] [mcap-daily] writing {len(day_totals)} aggregates into {TABLE_MCAP_DAILY}")
         if AGG_MIN_COINS:

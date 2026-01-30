@@ -65,6 +65,9 @@ AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", "200"))
 if AGG_MIN_COINS < 0:
     AGG_MIN_COINS = 0
 
+# Safety: avoid clearing tables by default (keeps frontend stable during rebuilds)
+TRUNCATE_TARGETS = os.getenv("TRUNCATE_TARGETS", "0") == "1"
+
 CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
 
 NOW_UTC       = datetime.now(timezone.utc)
@@ -364,11 +367,14 @@ def main():
     print(f"[{now_str()}] Aggregation complete in {time.time()-t0:.1f}s "
           f"(10m buckets={len(acc_10m)}, hourly buckets={len(acc_hourly)}, daily buckets={len(acc_daily)})")
 
-    print(f"[{now_str()}] TRUNCATING targets ...")
-    session.execute(TRUNC_10M)
-    session.execute(TRUNC_H)
-    session.execute(TRUNC_D)
-    print(f"[{now_str()}] Truncated: {DST_10M}, {DST_HOURLY}, {DST_DAILY}")
+    if TRUNCATE_TARGETS:
+        print(f"[{now_str()}] TRUNCATING targets ...")
+        session.execute(TRUNC_10M)
+        session.execute(TRUNC_H)
+        session.execute(TRUNC_D)
+        print(f"[{now_str()}] Truncated: {DST_10M}, {DST_HOURLY}, {DST_DAILY}")
+    else:
+        print(f"[{now_str()}] [safe] not truncating targets (TRUNCATE_TARGETS=0)")
 
     w10 = flush_10m(session, acc_10m, INS_10M, batch_every=BATCH_FLUSH_EVERY)
     wh  = flush_hourly(session, acc_hourly, INS_H, batch_every=BATCH_FLUSH_EVERY)
