@@ -1,4 +1,4 @@
-"""Load asset categories into a single canonical table keyed by coinpaprika id.
+"""Load asset categories into a single canonical table keyed by CoinGecko id.
 Reads CSV (id, symbol?, category) and upserts rows into asset_categories.
 """
 
@@ -68,7 +68,7 @@ UP_CAT = s.prepare("""
 
 def autodetect_and_load(path: str) -> list[dict]:
     """
-    Return records with keys: id (coinpaprika), symbol, category.
+    Return records with keys: id (CoinGecko), symbol, category.
     Tries common delimiters and is robust to header cases.
     """
     records: list[dict] = []

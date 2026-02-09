@@ -52,7 +52,7 @@ RANK_TOP_N            = int(os.getenv("RANK_TOP_N", str(TOP_N)))
 # Use a large positive int for ASC clustering; switch to -1 if you use DESC.
 SENTINEL_UNRANKED = 2_000_000_000  # Cassandra int is 32-bit; this fits.
 
-# categories (Symbol -> Category; default path resolved relative to this file)
+# categories (ID/Symbol -> Category; default path resolved relative to this file)
 _THIS_DIR = pathlib.Path(__file__).resolve().parent
 _DEFAULT_CATEGORY_FILE = _THIS_DIR / "category_mapping.csv"
 CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(_DEFAULT_CATEGORY_FILE))
@@ -81,34 +81,60 @@ if not API_KEY:
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # ─────────────── Category mapping (file may live next to this script) ───────────────
-def load_category_map(path: str) -> dict:
-    m = {}
+def load_category_map(path: str) -> tuple[dict, dict]:
+    id_map: dict[str, str] = {}
+    sym_map: dict[str, str] = {}
+    dup_id = 0
+    dup_sym = 0
     try:
         with open(path, "r", encoding="utf-8-sig", newline="") as f:
             for delim in [",", ";", "\t", "|"]:
                 f.seek(0)
                 reader = csv.DictReader(f, delimiter=delim)
                 headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-                if "symbol" in headers and "category" in headers:
-                    sym_key = reader.fieldnames[headers.index("symbol")]
+                if "category" in headers and ("id" in headers or "symbol" in headers):
+                    id_key = reader.fieldnames[headers.index("id")] if "id" in headers else None
+                    sym_key = reader.fieldnames[headers.index("symbol")] if "symbol" in headers else None
                     cat_key = reader.fieldnames[headers.index("category")]
                     for row in reader:
-                        sym = (row.get(sym_key) or "").strip().upper()
                         cat = (row.get(cat_key) or "").strip()
-                        if sym:
-                            m[sym] = cat or "Other"
-                    print(f"[{now_str()}] [category] loaded {len(m)} rows from {path}")
+                        if id_key:
+                            cid = (row.get(id_key) or "").strip().lower()
+                            if cid:
+                                if cid in id_map and id_map[cid] != (cat or "Other"):
+                                    dup_id += 1
+                                id_map[cid] = cat or "Other"
+                        if sym_key:
+                            sym = (row.get(sym_key) or "").strip().upper()
+                            if sym:
+                                if sym in sym_map and sym_map[sym] != (cat or "Other"):
+                                    dup_sym += 1
+                                sym_map[sym] = cat or "Other"
+                    print(f"[{now_str()}] [category] loaded {len(id_map)} id rows, {len(sym_map)} symbol rows from {path}")
+                    if dup_id or dup_sym:
+                        print(f"[{now_str()}] [category] warnings: duplicate id={dup_id}, duplicate symbol={dup_sym} (last value kept)")
                     break
             else:
-                print(f"[{now_str()}] [category] header not found in {path} (need Symbol,Category)")
+                print(f"[{now_str()}] [category] header not found in {path} (need id/category or symbol/category)")
     except FileNotFoundError:
         print(f"[{now_str()}] [category] file not found: {path} — defaulting to 'Other'")
     except Exception as e:
         print(f"[{now_str()}] [category] failed to read {path}: {e} — defaulting to 'Other'")
-    return m
+    return id_map, sym_map
 
-CATEGORY_MAP = load_category_map(CATEGORY_FILE)
-def category_for(sym: str) -> str: return CATEGORY_MAP.get((sym or "").upper(), "Other")
+ID_CATEGORY_MAP, SYMBOL_CATEGORY_MAP = load_category_map(CATEGORY_FILE)
+def category_for(coin_id, sym) -> str:
+    cid = (coin_id or "").strip().lower()
+    if cid:
+        cat = ID_CATEGORY_MAP.get(cid)
+        if cat:
+            return cat
+    ssym = (sym or "").strip().upper()
+    if ssym:
+        cat = SYMBOL_CATEGORY_MAP.get(ssym)
+        if cat:
+            return cat
+    return "Other"
 
 # ───────────────────────── Connect via shared helper ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
@@ -344,7 +370,7 @@ def run_once():
         totl = f(c.get("total_supply"))
         maxs = f(c.get("max_supply"))
 
-        cat = category_for(sym)
+        cat = category_for(gid, sym)
 
         mcap_total = float(mcap) if mcap is not None else 0.0
         vol_total  = float(vol)  if vol  is not None else 0.0
