@@ -264,7 +264,14 @@ class KeyPool:
         return key
 
 
-KEY_POOL = KeyPool(_load_api_keys(), CG_REQ_INTERVAL_S, CG_MAX_RPM_PER_KEY)
+_KEY_POOL: Optional[KeyPool] = None
+
+
+def _get_key_pool() -> KeyPool:
+    global _KEY_POOL
+    if _KEY_POOL is None:
+        _KEY_POOL = KeyPool(_load_api_keys(), CG_REQ_INTERVAL_S, CG_MAX_RPM_PER_KEY)
+    return _KEY_POOL
 
 
 def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional[str] = None) -> dict[str, Any]:
@@ -273,7 +280,7 @@ def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional
     last_err: Optional[Exception] = None
 
     for attempt in range(1, CG_RETRIES + 1):
-        key = KEY_POOL.reserve(hint=hint, retry_offset=(attempt - 1))
+        key = _get_key_pool().reserve(hint=hint, retry_offset=(attempt - 1))
         req_params = dict(base_params)
         headers: dict[str, str] = {}
 
