@@ -1,0 +1,20 @@
+name: gecko-prod-schedule-smoke
+# scheduler-touch: 2026-02-14
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7-59/10 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: UTC now
+        run: |
+          echo "schedule-smoke fired"
+          date -u +"%Y-%m-%d %H:%M:%S UTC"

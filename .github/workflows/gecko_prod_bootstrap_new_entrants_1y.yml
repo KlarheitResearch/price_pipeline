@@ -1,4 +1,5 @@
 name: gecko-prod-bootstrap-new-entrants-1y
+# scheduler-touch: 2026-02-14
 
 on:
   workflow_dispatch:
