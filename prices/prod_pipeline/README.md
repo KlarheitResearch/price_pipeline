@@ -89,6 +89,7 @@ How it works:
 
 Why it exists:
 - establishes the canonical coin universe and freshest point source for 10m/hour/day/month.
+- in production cadence, tier1 live snapshots run every 5m to reduce slot-edge delays before 10m candle materialization.
 
 ### `BB_refresh_live_derivatives.py`
 Purpose:
@@ -260,6 +261,7 @@ Mapping from legacy scripts to new equivalents and migration recommendations.
 ## Workflow Integration
 
 Tier workflows:
+- `backend/.github/workflows/gecko_prod_live_tier1_5m.yml`
 - `backend/.github/workflows/gecko_prod_tier1_10m.yml`
 - `backend/.github/workflows/gecko_prod_tier2_hourly.yml`
 - `backend/.github/workflows/gecko_prod_tier3_4h.yml`
@@ -269,7 +271,8 @@ Tier workflows:
 - `backend/.github/workflows/gecko_prod_bootstrap_new_entrants_1y.yml`
 
 Cadence:
-- tier1 rank `1..200` every 10m
+- tier1 live snapshot (`AA`, rank `1..200`) every 5m
+- tier1 build/finalize (`BB+CC+DD+EE`, rank `1..200`) every 10m (`PP_SLOTS_BACKFILL=4`)
 - tier2 rank `201..600` hourly
 - tier3 rank `601..1000` every 4h
 - repair tier1 rank `1..200` hourly (`PP_REPAIR_10M_HOURS=6`)

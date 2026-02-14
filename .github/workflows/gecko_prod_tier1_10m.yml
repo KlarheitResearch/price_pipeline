@@ -51,7 +51,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
-      RUN_LIVE: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_live || 'true') }}
+      RUN_LIVE: ${{ (github.event_name == 'schedule' && 'false') || (github.event.inputs.run_live || 'true') }}
       RUN_10M: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_10m || 'true') }}
       RUN_DERIV: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_derivatives || 'true') }}
       RUN_HOURLY: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_hourly || 'true') }}
@@ -60,7 +60,7 @@ jobs:
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       PP_RANK_START: "1"
       PP_RANK_END: "200"
-      PP_SLOTS_BACKFILL: "2"
+      PP_SLOTS_BACKFILL: "4"
     steps:
       - uses: actions/checkout@v4
 
