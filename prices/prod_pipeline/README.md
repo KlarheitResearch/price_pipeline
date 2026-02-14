@@ -69,7 +69,7 @@ Maintenance tables:
 Shared foundation for all scripts:
 - Astra connection (`connect_astra`)
 - CoinGecko API client with retry/backoff and key rotation (`COINGECKO_API_KEY_AA/BB`)
-- scope resolution (`PP_RANK_START/PP_RANK_END` or `PP_TEST_COIN_IDS`)
+- scope resolution (`PP_RANK_START/PP_RANK_END` or `PP_TEST_COIN_IDS`, with optional timed test override via `PP_TEST_MODE_UNTIL_UTC` / `PP_FORCE_TEST_MODE`)
 - category mapping loader from `backend/prices/category_mapping.csv`
 - time helpers (UTC normalization, flooring, Cassandra timestamp conversion)
 
@@ -280,6 +280,11 @@ Cadence:
 - repair tier3 rank `601..1000` daily (`PP_REPAIR_10M_HOURS=24`)
 - entrant bootstrap rank `1..1000` daily (`PP_BOOTSTRAP_DAYS=365`, capped by `PP_BOOTSTRAP_MAX_COINS`)
 
+Temporary parallel-run scope override:
+- if `PP_TEST_MODE_UNTIL_UTC` is set and current UTC is before that instant, rank windows are ignored and all workflows run only `PP_TEST_COIN_IDS`.
+- when cutoff is reached, the same workflows auto-return to tier rank windows (no code/workflow edits required).
+- optional hard override: `PP_FORCE_TEST_MODE=1`.
+
 All call lettered runtime entrypoints so execution order is explicit in logs and config.
 
 ## API Key Strategy
@@ -288,13 +293,18 @@ CoinGecko keys are loaded in this order:
 - `COINGECKO_API_KEYS` (comma-separated list, if set)
 - `COINGECKO_API_KEY_AA`
 - `COINGECKO_API_KEY_BB`
+- `COINGECKO_API_KEY_CC`
 - `COINGECKO_API_KEY`
+- optional exclusion list: `COINGECKO_DISABLED_KEYS` (comma-separated raw keys or env var names like `COINGECKO_API_KEY_CC`)
 
 Request-key selection behavior:
 - requests with a `hint` use stable hash routing (`crc32(hint) % key_count`)
 - requests without a `hint` use round-robin
 - retries for hinted requests hop to the next key (`base_index + retry_attempt`)
 - per-key throttling enforces both `CG_REQUEST_INTERVAL_S` and `CG_MAX_RPM_PER_KEY`
+- 429 rate-limit responses temporarily suspend that key (`CG_RATE_LIMIT_COOLDOWN_S`, default 75s)
+- credit/quota exhaustion responses suspend that key longer (`CG_CREDIT_EXHAUSTED_COOLDOWN_S`, default 12h)
+- 401 auth failures suspend that key (`CG_AUTH_FAILURE_COOLDOWN_S`, default 6h)
 
 ## Data Consistency Rules
 

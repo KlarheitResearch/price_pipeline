@@ -36,6 +36,8 @@ jobs:
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       PP_RANK_START: "1"
       PP_RANK_END: "200"
+      PP_TEST_MODE_UNTIL_UTC: "2026-02-16T23:59:59Z"
+      PP_TEST_COIN_IDS: "bitcoin,ethereum"
     steps:
       - uses: actions/checkout@v4
 
@@ -67,5 +69,6 @@ jobs:
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
         run: python prices/prod_pipeline/AA_load_live_selected.py

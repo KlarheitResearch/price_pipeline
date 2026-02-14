@@ -79,7 +79,33 @@ def get_test_coin_ids() -> list[str]:
     return out
 
 
+def _parse_utc_instant(raw: Optional[str]) -> Optional[datetime]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def _test_mode_active() -> bool:
+    if os.getenv("PP_FORCE_TEST_MODE", "0") == "1":
+        return True
+    until = _parse_utc_instant(os.getenv("PP_TEST_MODE_UNTIL_UTC"))
+    if until is None:
+        return False
+    return now_utc() < until
+
+
 def get_rank_window() -> Optional[tuple[int, int]]:
+    if _test_mode_active():
+        return None
     try:
         start = int((os.getenv("PP_RANK_START") or "0").strip() or "0")
         end = int((os.getenv("PP_RANK_END") or "0").strip() or "0")
@@ -206,20 +232,90 @@ CG_RETRIES = int(os.getenv("CG_RETRIES", "3"))
 CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.2"))
 CG_MAX_RPM_PER_KEY = int(os.getenv("CG_MAX_RPM_PER_KEY", "25"))
 CG_BACKOFF_BASE_S = float(os.getenv("CG_BACKOFF_BASE_S", "2.5"))
+CG_RATE_LIMIT_COOLDOWN_S = float(os.getenv("CG_RATE_LIMIT_COOLDOWN_S", "75"))
+CG_CREDIT_EXHAUSTED_COOLDOWN_S = float(os.getenv("CG_CREDIT_EXHAUSTED_COOLDOWN_S", "43200"))
+CG_AUTH_FAILURE_COOLDOWN_S = float(os.getenv("CG_AUTH_FAILURE_COOLDOWN_S", "21600"))
+
+
+def _parse_csv_env(raw: Optional[str]) -> list[str]:
+    out: list[str] = []
+    for part in (raw or "").split(","):
+        val = part.strip()
+        if val and val not in out:
+            out.append(val)
+    return out
+
+
+def _resolve_disabled_key_values(tokens: list[str]) -> set[str]:
+    out: set[str] = set()
+    for token in tokens:
+        t = token.strip()
+        if not t:
+            continue
+        # Allow either raw key values or env var names (e.g. COINGECKO_API_KEY_CC).
+        env_val = (os.getenv(t) or "").strip()
+        if env_val:
+            out.add(env_val)
+        else:
+            out.add(t)
+    return out
+
+
+def _mask_key(key: str) -> str:
+    if len(key) <= 8:
+        return "***"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _is_credit_exhaustion_text(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    positive = ("monthly", "credit", "quota", "usage cap", "plan limit", "billing", "upgrade plan")
+    if not any(tok in t for tok in positive):
+        return False
+    # Distinguish short-term rate limits from monthly plan exhaustion.
+    if ("per minute" in t or "minute rate" in t or "too many requests" in t) and ("monthly" not in t and "credit" not in t):
+        return False
+    return True
+
+
+def _extract_error_text(resp: requests.Response) -> str:
+    text = ""
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            if isinstance(payload.get("error"), str):
+                text = payload.get("error", "")
+            elif isinstance(payload.get("status"), dict):
+                status_obj = payload.get("status") or {}
+                text = str(status_obj.get("error_message") or status_obj.get("error_code") or "")
+            elif isinstance(payload.get("message"), str):
+                text = payload.get("message", "")
+            else:
+                text = str(payload)
+        else:
+            text = str(payload)
+    except Exception:
+        text = (resp.text or "").strip()
+    text = " ".join(text.split())
+    return text[:280]
 
 
 def _load_api_keys() -> list[str]:
     keys: list[str] = []
+    disabled = _resolve_disabled_key_values(_parse_csv_env(os.getenv("COINGECKO_DISABLED_KEYS")))
+
     packed = (os.getenv("COINGECKO_API_KEYS") or "").strip()
     if packed:
         for item in packed.split(","):
             k = item.strip()
-            if k and k not in keys:
+            if k and k not in disabled and k not in keys:
                 keys.append(k)
 
-    for env_name in ("COINGECKO_API_KEY_AA", "COINGECKO_API_KEY_BB", "COINGECKO_API_KEY"):
+    for env_name in ("COINGECKO_API_KEY_AA", "COINGECKO_API_KEY_BB", "COINGECKO_API_KEY_CC", "COINGECKO_API_KEY"):
         k = (os.getenv(env_name) or "").strip()
-        if k and k not in keys:
+        if k and k not in disabled and k not in keys:
             keys.append(k)
 
     return keys
@@ -228,11 +324,15 @@ def _load_api_keys() -> list[str]:
 class KeyPool:
     def __init__(self, keys: list[str], req_interval_s: float, max_rpm: int):
         if not keys:
-            raise RuntimeError("No CoinGecko API key found. Set COINGECKO_API_KEY_AA/BB or COINGECKO_API_KEYS.")
+            raise RuntimeError(
+                "No CoinGecko API key found. Set COINGECKO_API_KEY_AA/BB/CC, COINGECKO_API_KEY, or COINGECKO_API_KEYS."
+            )
         self.keys = keys
         self.req_interval_s = req_interval_s
         self.max_rpm = max_rpm
         self._times: dict[str, deque[float]] = {k: deque() for k in keys}
+        self._suspend_until: dict[str, float] = {k: 0.0 for k in keys}
+        self._suspend_reason: dict[str, str] = {k: "" for k in keys}
         self._rr = 0
 
     def _throttle(self, key: str) -> None:
@@ -251,6 +351,47 @@ class KeyPool:
             sleep_for = 60.0 - (now - dq[0]) + 0.01
             time.sleep(max(0.01, sleep_for))
 
+    def _pick_available_index(self, base_idx: int) -> tuple[Optional[int], float]:
+        now = time.time()
+        best_wait = 0.0
+        best_idx: Optional[int] = None
+        for offset in range(len(self.keys)):
+            idx = (base_idx + offset) % len(self.keys)
+            key = self.keys[idx]
+            wait_for = self._suspend_until.get(key, 0.0) - now
+            if wait_for <= 0:
+                return idx, 0.0
+            if best_idx is None or wait_for < best_wait:
+                best_idx = idx
+                best_wait = wait_for
+        return None, best_wait
+
+    def suspend(self, key: str, for_seconds: float, reason: str) -> None:
+        until = time.time() + max(1.0, float(for_seconds))
+        prev = self._suspend_until.get(key, 0.0)
+        if until > prev:
+            self._suspend_until[key] = until
+            self._suspend_reason[key] = reason
+            mins = max(1, int(round((until - time.time()) / 60.0)))
+            print(f"[{now_str()}] [cg] suspend key {_mask_key(key)} for ~{mins}m ({reason})")
+
+    def note_response(self, key: str, status_code: int, err_text: str) -> None:
+        txt = (err_text or "").strip()
+
+        if status_code == 429:
+            if _is_credit_exhaustion_text(txt):
+                self.suspend(key, CG_CREDIT_EXHAUSTED_COOLDOWN_S, "credit_exhausted")
+            else:
+                self.suspend(key, CG_RATE_LIMIT_COOLDOWN_S, "rate_limited")
+            return
+
+        if status_code in (402, 403) and _is_credit_exhaustion_text(txt):
+            self.suspend(key, CG_CREDIT_EXHAUSTED_COOLDOWN_S, f"http_{status_code}_credit_exhausted")
+            return
+
+        if status_code == 401:
+            self.suspend(key, CG_AUTH_FAILURE_COOLDOWN_S, "auth_failed")
+
     def reserve(self, hint: Optional[str] = None, retry_offset: int = 0) -> str:
         if hint and len(self.keys) > 1:
             base = zlib.crc32(hint.encode("utf-8")) % len(self.keys)
@@ -258,7 +399,21 @@ class KeyPool:
         else:
             idx = self._rr % len(self.keys)
             self._rr += 1
-        key = self.keys[idx]
+
+        usable_idx, next_wait = self._pick_available_index(idx)
+        if usable_idx is None:
+            details = []
+            now = time.time()
+            for key_i in self.keys:
+                wait_s = max(0.0, self._suspend_until.get(key_i, 0.0) - now)
+                reason = self._suspend_reason.get(key_i, "") or "unknown"
+                details.append(f"{_mask_key(key_i)}={int(wait_s)}s({reason})")
+            raise RuntimeError(
+                "All CoinGecko keys are temporarily suspended; "
+                f"next key available in {max(1, int(next_wait))}s; details: {', '.join(details)}"
+            )
+
+        key = self.keys[usable_idx]
         self._throttle(key)
         self._times[key].append(time.time())
         return key
@@ -293,12 +448,20 @@ def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional
 
         try:
             resp = requests.get(url, params=req_params, headers=headers, timeout=CG_TIMEOUT_SEC)
+            status_code = resp.status_code
+            err_text = _extract_error_text(resp) if status_code >= 400 else ""
+            if status_code >= 400:
+                _get_key_pool().note_response(key, status_code, err_text)
 
-            if resp.status_code in (408, 429, 500, 502, 503, 504):
+            if status_code in (401, 402, 403, 408, 429, 500, 502, 503, 504):
                 wait_s = CG_BACKOFF_BASE_S * attempt + random.uniform(0.0, 0.5)
-                print(f"[{now_str()}] [cg] {path} -> {resp.status_code}; retry in {wait_s:.1f}s ({attempt}/{CG_RETRIES})")
+                extra = f" err={err_text}" if err_text else ""
+                print(
+                    f"[{now_str()}] [cg] {path} -> {status_code}; retry in {wait_s:.1f}s "
+                    f"({attempt}/{CG_RETRIES}); key={_mask_key(key)}{extra}"
+                )
                 time.sleep(wait_s)
-                last_err = requests.HTTPError(f"{resp.status_code}", response=resp)
+                last_err = requests.HTTPError(f"{status_code}", response=resp)
                 continue
 
             resp.raise_for_status()
