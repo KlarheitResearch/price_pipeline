@@ -39,19 +39,40 @@ def _f(x):
         return None
 
 
+def _pick_price_from_row(row):
+    for field in ("open", "close", "high", "low", "price_usd"):
+        v = _f(getattr(row, field, None))
+        if v is not None:
+            return v
+    return None
+
+
 def build_day_from_10m(rows, day_start, day_end):
     if not rows:
         return None
     ordered = sorted(rows, key=lambda r: to_utc(getattr(r, "ts", None)) or day_start)
-    first = ordered[0]
     last = ordered[-1]
 
-    open_price = _f(getattr(first, "open", None))
-    close = _f(getattr(last, "close", None))
-    if open_price is None:
-        open_price = _f(getattr(first, "close", None))
-    if close is None:
+    open_price = None
+    for r in ordered:
+        open_price = _pick_price_from_row(r)
+        if open_price is not None:
+            break
+
+    close = None
+    for r in reversed(ordered):
+        close = _f(getattr(r, "close", None))
+        if close is None:
+            close = _pick_price_from_row(r)
+        if close is not None:
+            break
+
+    if open_price is None and close is None:
         return None
+    if open_price is None:
+        open_price = close
+    if close is None:
+        close = open_price
 
     highs = []
     lows = []
@@ -61,6 +82,8 @@ def build_day_from_10m(rows, day_start, day_end):
         h = _f(getattr(r, "high", None))
         l = _f(getattr(r, "low", None))
         c = _f(getattr(r, "close", None))
+        if c is None:
+            c = _pick_price_from_row(r)
         if h is None and c is not None:
             h = c
         if l is None and c is not None:
@@ -117,7 +140,7 @@ def main() -> None:
 
         sel_10m = session.prepare(
             f"""
-            SELECT ts, open, high, low, close,
+            SELECT ts, open, high, low, close, price_usd,
                    market_cap, volume_24h, market_cap_rank,
                    circulating_supply, total_supply,
                    point_count, last_updated
