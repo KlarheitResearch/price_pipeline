@@ -9,6 +9,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_LIVE,
     UTC,
@@ -49,6 +50,9 @@ def main() -> None:
         raise RuntimeError("PP_AUDIT_WINDOW_DAYS must be > 0")
 
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "90_audit_10m_gaps")
+    tracker.set_metric("audit_window_days", AUDIT_WINDOW_DAYS)
+    tracker.start()
     try:
         sel_live = SimpleStatement(
             f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
@@ -58,7 +62,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         now = now_utc()
         end_excl = datetime(now.year, now.month, now.day, tzinfo=UTC) + timedelta(days=1)
@@ -151,6 +159,11 @@ def main() -> None:
             f"[{now_str()}] Audit done. coins_with_gaps={total_with_gaps}/{len(coins)} "
             f"top_gap_offenders={','.join([f'{sym}:{cid}' for _s, sym, cid in worst[:5]])}"
         )
+        tracker.set_metric("coins_with_gaps", total_with_gaps)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

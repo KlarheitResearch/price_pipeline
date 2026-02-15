@@ -104,6 +104,7 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           PP_BOOTSTRAP_DAYS: ${{ env.PP_BOOTSTRAP_DAYS_RESOLVED }}
           PP_BOOTSTRAP_MAX_COINS: ${{ env.PP_BOOTSTRAP_MAX_COINS_RESOLVED }}
           PP_BOOTSTRAP_OVERWRITE: "0"
@@ -111,4 +112,3 @@ jobs:
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/96_bootstrap_new_entrants_1y.py
-

@@ -9,6 +9,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_LIVE,
     TABLE_ROLLING,
@@ -143,6 +144,10 @@ def _can_overwrite(existing_row, new_source: str, new_point_count: int) -> bool:
 def main() -> None:
     hb = Heartbeat("CC_build_10m_intraday")
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "CC_build_10m_intraday")
+    tracker.set_metric("slots_backfill", SLOTS_BACKFILL)
+    tracker.set_metric("heal_recent_slots", CC_HEAL_RECENT_SLOTS)
+    tracker.start()
 
     sel_live = SimpleStatement(
         f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
@@ -152,10 +157,19 @@ def main() -> None:
     coins = select_coins_from_live_rows(live_rows)
     if not coins:
         print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}; run AA_load_live_selected.py first.")
+        tracker.mark_noop()
+        tracker.set_metric("coins_scoped", 0)
+        tracker.finish("noop")
+        try:
+            cluster.shutdown()
+        except Exception:
+            pass
         return
+    tracker.set_metric("coins_scoped", len(coins))
 
     print(f"[{now_str()}] Building 10m intraday for scope={scope_label()} coins={len(coins)}")
     slots = last_n_slots_oldest_first(SLOTS_BACKFILL)
+    tracker.set_metric("slots_count", len(slots))
     print(f"[{now_str()}] Slots: {slots[0][0]} .. {slots[-1][1]} (count={len(slots)})")
 
     sel_in_slot = session.prepare(
@@ -442,6 +456,14 @@ def main() -> None:
                     (),
                     {"candle_source": "carry_prev", "point_count": 0},
                 )()
+        tracker.set_metric("rows_written", wrote)
+        tracker.set_metric("rows_skipped", skipped)
+        tracker.set_metric("rows_skipped_downgrade", skipped_downgrade)
+        tracker.set_metric("rows_healed_api", immediate_healed)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

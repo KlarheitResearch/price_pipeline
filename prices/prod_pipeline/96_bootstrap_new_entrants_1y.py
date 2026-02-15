@@ -12,6 +12,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_DAILY,
     TABLE_LIVE,
     UTC,
@@ -98,6 +99,11 @@ def main() -> None:
     )
 
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "96_bootstrap_new_entrants_1y")
+    tracker.set_metric("bootstrap_days", BOOTSTRAP_DAYS)
+    tracker.set_metric("bootstrap_max_coins", BOOTSTRAP_MAX_COINS)
+    tracker.set_metric("bootstrap_overwrite", 1 if BOOTSTRAP_OVERWRITE else 0)
+    tracker.start()
     total_inserted = 0
     bootstrapped_coins = 0
     try:
@@ -109,7 +115,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         sel_first = session.prepare(
             f"""
@@ -156,10 +166,15 @@ def main() -> None:
 
         if not candidates:
             print(f"[{now_str()}] No entrant bootstrap candidates found.")
+            tracker.mark_noop()
+            tracker.set_metric("candidates_total", 0)
+            tracker.finish("noop")
             return
 
         candidates.sort(key=lambda c: (c.market_cap_rank if isinstance(c.market_cap_rank, int) else 10**9, c.id))
         to_process = candidates[:BOOTSTRAP_MAX_COINS]
+        tracker.set_metric("candidates_total", len(candidates))
+        tracker.set_metric("candidates_processed", len(to_process))
 
         print(f"[{now_str()}] Candidates={len(candidates)} processing={len(to_process)}")
         hb = Heartbeat("96_bootstrap_new_entrants_1y")
@@ -270,6 +285,13 @@ def main() -> None:
             f"[{now_str()}] Entrant bootstrap done. "
             f"bootstrapped_coins={bootstrapped_coins} inserted_days={total_inserted}"
         )
+        tracker.set_metric("bootstrapped_coins", bootstrapped_coins)
+        tracker.set_metric("inserted_days", total_inserted)
+        tracker.set_metric("monthly_followup_planned", 1 if (total_inserted > 0 and BOOTSTRAP_RUN_MONTHLY_BACKFILL) else 0)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

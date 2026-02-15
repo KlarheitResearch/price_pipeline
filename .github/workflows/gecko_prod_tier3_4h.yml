@@ -115,7 +115,12 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+          PP_LIVE_PROJECT_PARTIALS: "1"
+          PP_LIVE_PROJECT_10M: "1"
+          PP_LIVE_PROJECT_HOURLY: "1"
+          PP_LIVE_PROJECT_DAILY: "1"
         run: python prices/prod_pipeline/AA_load_live_selected.py
 
       - name: Refresh live ranked + live mcap (top 1000)
@@ -139,6 +144,7 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
           PP_SLOT_DELAY_SEC: "90"
           PP_CC_HEAL_RECENT_SLOTS: "3"
@@ -156,6 +162,7 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           PP_SLOT_DELAY_SEC: "90"
           PP_HOURLY_FINALIZE_LOOKBACK: "6"
           REQUEST_TIMEOUT_SEC: "45"
@@ -171,6 +178,7 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           PP_SLOT_DELAY_SEC: "90"
           PP_DAILY_FINALIZE_LOOKBACK_DAYS: "2"
           REQUEST_TIMEOUT_SEC: "45"
@@ -185,4 +193,3 @@ jobs:
           PP_MONTHLY_FINALIZE_LOOKBACK: "2"
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/EG_build_monthly_from_daily.py
-

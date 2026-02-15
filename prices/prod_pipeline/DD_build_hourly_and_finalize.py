@@ -8,6 +8,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_HOURLY,
     TABLE_LIVE,
@@ -103,8 +104,12 @@ def build_hour_from_10m(rows, slot_start, slot_end):
         highs = [open_price, close]
         lows = [open_price, close]
 
-    high = max([open_price] + highs + [close])
-    low = min([open_price] + lows + [close])
+    safe_highs = [v for v in ([open_price] + highs + [close]) if v is not None]
+    safe_lows = [v for v in ([open_price] + lows + [close]) if v is not None]
+    if not safe_highs or not safe_lows:
+        return None
+    high = max(safe_highs)
+    low = min(safe_lows)
     if last_updated is None:
         last_updated = slot_end - timedelta(seconds=1)
 
@@ -127,6 +132,12 @@ def build_hour_from_10m(rows, slot_start, slot_end):
 def main() -> None:
     hb = Heartbeat("DD_build_hourly_and_finalize")
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "DD_build_hourly_and_finalize")
+    tracker.set_metric("hourly_finalize_lookback", HOURLY_FINALIZE_LOOKBACK)
+    tracker.start()
+    wrote_partial = 0
+    wrote_provisional = 0
+    wrote_final = 0
     try:
         sel_live = SimpleStatement(
             f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
@@ -136,7 +147,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}; run AA_load_live_selected.py first.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         sel_10m = session.prepare(
             f"""
@@ -207,6 +222,7 @@ def main() -> None:
                         ],
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
+                    wrote_partial += 1
                     print(f"[{now_str()}] {coin.id} upserted partial hour {curr_hour_start}")
 
             # 2) Closed hour(s): provisional from 10m + API finalization
@@ -243,6 +259,7 @@ def main() -> None:
                         ],
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
+                    wrote_provisional += 1
 
                 if api_finalize_data is None:
                     continue
@@ -271,7 +288,15 @@ def main() -> None:
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
                 )
+                wrote_final += 1
                 print(f"[{now_str()}] {coin.id} finalized hour via API: {hour_start}")
+        tracker.set_metric("rows_partial", wrote_partial)
+        tracker.set_metric("rows_provisional", wrote_provisional)
+        tracker.set_metric("rows_final_api", wrote_final)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

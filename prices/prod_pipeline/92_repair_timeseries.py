@@ -15,6 +15,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_LIVE,
     UTC,
@@ -200,10 +201,22 @@ def main() -> None:
     )
 
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "92_repair_timeseries")
+    tracker.set_metric("repair_10m_hours", REPAIR_10M_HOURS)
+    tracker.set_metric("repair_interpolate", 1 if REPAIR_INTERPOLATE else 0)
+    tracker.set_metric("repair_rewrite_non_api", 1 if REPAIR_REWRITE_NON_API else 0)
+    tracker.set_metric("followup_hourly", 1 if RUN_HOURLY else 0)
+    tracker.set_metric("followup_daily", 1 if RUN_DAILY else 0)
+    tracker.set_metric("followup_monthly", 1 if RUN_MONTHLY else 0)
+    tracker.set_metric("followup_mcap", 1 if RUN_MCAP else 0)
+    tracker.start()
     base_dir = pathlib.Path(__file__).resolve().parent
     total_inserted = 0
     try:
         if not _try_acquire_lock(session):
+            tracker.mark_noop()
+            tracker.set_metric("lock_skipped", 1)
+            tracker.finish("noop")
             return
 
         sel_live = SimpleStatement(
@@ -217,7 +230,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         sel_10m_range = session.prepare(
             f"""
@@ -499,6 +516,16 @@ def main() -> None:
             f"non_api_targets={total_non_api_targets} inserted={total_inserted} "
             f"skipped_downgrade={total_skipped_downgrade}"
         )
+        tracker.set_metric("missing_slots", total_missing)
+        tracker.set_metric("non_api_targets", total_non_api_targets)
+        tracker.set_metric("inserted_slots", total_inserted)
+        tracker.set_metric("skipped_downgrade", total_skipped_downgrade)
+        planned_followups = int(total_inserted > 0 and (RUN_HOURLY or RUN_DAILY or RUN_MONTHLY or RUN_MCAP))
+        tracker.set_metric("followups_planned", planned_followups)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

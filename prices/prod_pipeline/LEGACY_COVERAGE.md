@@ -1,12 +1,17 @@
 # Legacy Coverage Matrix
 
-This maps legacy `backend/prices/*` scripts to the new `backend/prices/prod_pipeline/*` pipeline.
+This maps legacy `backend/prices/*` scripts to `backend/prices/prod_pipeline/*`.
+
+Current state:
+- Prod workflows now execute `prod_pipeline` scripts.
+- They target legacy production tables (`gecko_*`, `coin_*`, `job_locks`) via workflow `PP_TABLE_*` env overrides.
+- Legacy scripts/workflows are retained in backup/hold paths.
 
 ## Runtime Pipeline
 
 | Legacy | New | Status | Recommendation |
 |---|---|---|---|
-| `AA_gck_load_prices_live.py` | `AA_load_live_selected.py` + `BB_refresh_live_derivatives.py` | Covered | Use new pipeline for live/rolling/ranked/mcap-live in shadow run. |
+| `AA_gck_load_prices_live.py` | `AA_load_live_selected.py` + `BB_refresh_live_derivatives.py` | Covered | Use prod pipeline in production. |
 | `CC_gck_append_10m_from_live.py` | `CC_build_10m_intraday.py` | Covered (core) | Use new pipeline. Keep legacy gapfill tooling only as fallback. |
 | `DD_gck_create_hourly_from_10m.py` | `DD_build_hourly_and_finalize.py` | Covered (improved finalize) | Use new pipeline. |
 | `EE_gck_create_daily_from_10m.py` | `EE_build_daily_and_finalize.py` | Covered (improved finalize) | Use new pipeline. |
@@ -18,7 +23,7 @@ This maps legacy `backend/prices/*` scripts to the new `backend/prices/prod_pipe
 | Legacy | New | Status | Recommendation |
 |---|---|---|---|
 | `category_mapping.csv` | `common.py` category loader (`PP_CATEGORY_FILE`) | Covered | Keep using CSV; no change needed. |
-| `load_categories.py` | `94_materialize_asset_categories.py` | Covered (optional) | Use when you want a dedicated categories table (`pp_asset_categories`). |
+| `load_categories.py` | `94_materialize_asset_categories.py` | Covered (optional) | Use when you want a dedicated categories table. |
 
 ## DQ / Repair / Audit
 
@@ -32,7 +37,7 @@ This maps legacy `backend/prices/*` scripts to the new `backend/prices/prod_pipe
 
 ## Practical Migration Guidance
 
-1. Use new lettered runtime pipeline (`AA..HH`) for normal scheduled processing.
-2. Use new maintenance scripts (`90..96`) for audit/coverage/repair/backfill/bootstrap/category materialization.
-3. Keep legacy DQ/repair scripts active at lower frequency only during early shadow run.
-4. Retire legacy runtime scripts only after shadow-run parity is stable.
+1. Use lettered runtime pipeline (`AA..HH`) for scheduled production processing.
+2. Use maintenance scripts (`90..96`) for audit/coverage/repair/backfill/bootstrap/category materialization.
+3. Keep legacy scripts/workflows only as cold backup (`hold_legacy`).
+4. Operational trigger source is Cloudflare Worker -> GitHub workflow dispatch.

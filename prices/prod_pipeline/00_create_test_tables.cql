@@ -238,3 +238,40 @@ CREATE TABLE IF NOT EXISTS pp_job_locks (
     created_at timestamp,
     PRIMARY KEY ((job), bucket)
 );
+
+CREATE TABLE IF NOT EXISTS pp_pipeline_runs (
+    script text,
+    started_at timestamp,
+    run_id text,
+    workflow text,
+    trigger_source text,
+    scope text,
+    rank_start int,
+    rank_end int,
+    status text,
+    ended_at timestamp,
+    duration_sec int,
+    metrics_json text,
+    error text,
+    host text,
+    updated_at timestamp,
+    PRIMARY KEY ((script), started_at, run_id)
+) WITH CLUSTERING ORDER BY (started_at DESC, run_id DESC);
+
+CREATE TABLE IF NOT EXISTS pp_pipeline_latest (
+    script text PRIMARY KEY,
+    run_id text,
+    workflow text,
+    trigger_source text,
+    scope text,
+    rank_start int,
+    rank_end int,
+    status text,
+    started_at timestamp,
+    ended_at timestamp,
+    duration_sec int,
+    metrics_json text,
+    error text,
+    host text,
+    updated_at timestamp
+);

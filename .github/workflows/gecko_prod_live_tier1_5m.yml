@@ -89,6 +89,10 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+          PP_LIVE_PROJECT_PARTIALS: "1"
+          PP_LIVE_PROJECT_10M: "1"
+          PP_LIVE_PROJECT_HOURLY: "1"
+          PP_LIVE_PROJECT_DAILY: "1"
         run: python prices/prod_pipeline/AA_load_live_selected.py
-

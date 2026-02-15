@@ -8,6 +8,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_LIVE,
@@ -127,6 +128,12 @@ def build_day_from_10m(rows, day_start, day_end):
 def main() -> None:
     hb = Heartbeat("EE_build_daily_and_finalize")
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "EE_build_daily_and_finalize")
+    tracker.set_metric("daily_finalize_lookback_days", DAILY_FINALIZE_LOOKBACK_DAYS)
+    tracker.start()
+    wrote_partial = 0
+    wrote_provisional = 0
+    wrote_final = 0
     try:
         sel_live = SimpleStatement(
             f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
@@ -136,7 +143,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}; run AA_load_live_selected.py first.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         sel_10m = session.prepare(
             f"""
@@ -208,6 +219,7 @@ def main() -> None:
                         ],
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
+                    wrote_partial += 1
                     print(f"[{now_str()}] {coin.id} upserted partial day {today}")
 
             # 2) Closed day(s): provisional from 10m + API finalization
@@ -244,6 +256,7 @@ def main() -> None:
                         ],
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
+                    wrote_provisional += 1
 
                 if api_finalize_data is None:
                     continue
@@ -272,7 +285,15 @@ def main() -> None:
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
                 )
+                wrote_final += 1
                 print(f"[{now_str()}] {coin.id} finalized day via API: {day_key}")
+        tracker.set_metric("rows_partial", wrote_partial)
+        tracker.set_metric("rows_provisional", wrote_provisional)
+        tracker.set_metric("rows_final_api", wrote_final)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

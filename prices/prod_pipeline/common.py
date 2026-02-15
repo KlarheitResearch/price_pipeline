@@ -8,6 +8,9 @@ import random
 import zlib
 import pathlib
 import csv
+import json
+import socket
+import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -224,6 +227,9 @@ TABLE_MCAP_LIVE = os.getenv("PP_TABLE_MCAP_LIVE", "pp_market_cap_live")
 TABLE_MCAP_10M = os.getenv("PP_TABLE_MCAP_10M", "pp_market_cap_10m_7d")
 TABLE_MCAP_HOURLY = os.getenv("PP_TABLE_MCAP_HOURLY", "pp_market_cap_hourly_30d")
 TABLE_MCAP_DAILY = os.getenv("PP_TABLE_MCAP_DAILY", "pp_market_cap_daily_contin")
+TABLE_PIPELINE_RUNS = os.getenv("PP_TABLE_PIPELINE_RUNS", "pp_pipeline_runs")
+TABLE_PIPELINE_LATEST = os.getenv("PP_TABLE_PIPELINE_LATEST", "pp_pipeline_latest")
+PIPELINE_HEALTH_ENABLED = _env_flag("PP_HEALTH_ENABLED", True)
 
 
 def _load_category_maps() -> tuple[dict[str, str], dict[str, str]]:
@@ -291,6 +297,168 @@ def connect_astra():
     return get_session(return_cluster=True)
 
 
+class PipelineHealthTracker:
+    def __init__(self, session, script: str):
+        self.session = session
+        self.script = script
+        self.run_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+        self.started_at = now_utc()
+        self.ended_at: Optional[datetime] = None
+        self.workflow = (os.getenv("GITHUB_WORKFLOW") or os.getenv("PP_WORKFLOW_NAME") or "").strip() or None
+        gh_event = (os.getenv("GITHUB_EVENT_NAME") or "").strip()
+        if gh_event:
+            self.trigger_source = f"github:{gh_event}"
+        elif (os.getenv("CF_WORKER_NAME") or os.getenv("WORKER_NAME") or "").strip():
+            self.trigger_source = "cloudflare:cron"
+        else:
+            self.trigger_source = "manual"
+        self.scope = scope_label()
+        rw = get_rank_window()
+        self.rank_start = rw[0] if rw else None
+        self.rank_end = rw[1] if rw else None
+        self.host = (os.getenv("HOSTNAME") or socket.gethostname() or "").strip() or None
+        self.metrics: dict[str, Any] = {}
+        self._final_status = "success"
+        self._started = False
+        self._finished = False
+        self._disabled = not PIPELINE_HEALTH_ENABLED
+        self._warned = False
+        self._error_text: Optional[str] = None
+
+    def set_metric(self, name: str, value: Any) -> None:
+        self.metrics[str(name)] = value
+
+    def inc_metric(self, name: str, delta: int | float = 1) -> None:
+        key = str(name)
+        prev = self.metrics.get(key, 0)
+        try:
+            self.metrics[key] = prev + delta
+        except Exception:
+            self.metrics[key] = delta
+
+    def mark_noop(self) -> None:
+        self._final_status = "noop"
+
+    def start(self) -> None:
+        if self._started or self._disabled:
+            return
+        self._started = True
+        self._write_row(status="running", error_text=None)
+
+    def finish(self, status: str | None = None, error_text: Optional[str] = None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self.ended_at = now_utc()
+        if status is None:
+            status = self._final_status
+        if error_text is not None:
+            self._error_text = str(error_text)
+        self._write_row(status=status, error_text=self._error_text)
+
+    def _warn_disable(self, msg: str) -> None:
+        if not self._warned:
+            print(f"[{now_str()}] [health] disabled for {self.script}: {msg}")
+            self._warned = True
+        self._disabled = True
+
+    def _metrics_json(self) -> str:
+        try:
+            text = json.dumps(self.metrics, separators=(",", ":"), sort_keys=True, default=str)
+        except Exception:
+            text = "{}"
+        if len(text) > 16000:
+            text = text[:16000]
+        return text
+
+    def _write_row(self, status: str, error_text: Optional[str]) -> None:
+        if self._disabled:
+            return
+        try:
+            now_ts = now_utc()
+            duration_sec = int((now_ts - self.started_at).total_seconds()) if self.started_at else None
+            metrics_json = self._metrics_json()
+            err = (error_text or "").strip() or None
+            if err and len(err) > 1000:
+                err = err[:1000]
+
+            ps_run = self.session.prepare(
+                f"""
+                INSERT INTO {TABLE_PIPELINE_RUNS}
+                  (script, started_at, run_id,
+                   workflow, trigger_source, scope, rank_start, rank_end,
+                   status, ended_at, duration_sec,
+                   metrics_json, error, host, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            self.session.execute(
+                ps_run,
+                [
+                    self.script,
+                    to_cassandra_ts(self.started_at),
+                    self.run_id,
+                    self.workflow,
+                    self.trigger_source,
+                    self.scope,
+                    self.rank_start,
+                    self.rank_end,
+                    status,
+                    to_cassandra_ts(self.ended_at) if self.ended_at is not None else None,
+                    duration_sec,
+                    metrics_json,
+                    err,
+                    self.host,
+                    to_cassandra_ts(now_ts),
+                ],
+            )
+
+            ps_latest = self.session.prepare(
+                f"""
+                INSERT INTO {TABLE_PIPELINE_LATEST}
+                  (script, run_id,
+                   workflow, trigger_source, scope, rank_start, rank_end,
+                   status, started_at, ended_at, duration_sec,
+                   metrics_json, error, host, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+            )
+            self.session.execute(
+                ps_latest,
+                [
+                    self.script,
+                    self.run_id,
+                    self.workflow,
+                    self.trigger_source,
+                    self.scope,
+                    self.rank_start,
+                    self.rank_end,
+                    status,
+                    to_cassandra_ts(self.started_at),
+                    to_cassandra_ts(self.ended_at) if self.ended_at is not None else None,
+                    duration_sec,
+                    metrics_json,
+                    err,
+                    self.host,
+                    to_cassandra_ts(now_ts),
+                ],
+            )
+        except Exception as exc:
+            self._warn_disable(str(exc))
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, _tb):
+        if exc is None:
+            self.finish(self._final_status, self._error_text)
+            return False
+        err = f"{exc_type.__name__}: {exc}" if exc_type is not None else str(exc)
+        self.finish("failed", err)
+        return False
+
+
 API_TIER = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()
 API_BASE = os.getenv(
     "COINGECKO_BASE_URL",
@@ -304,6 +472,10 @@ CG_BACKOFF_BASE_S = float(os.getenv("CG_BACKOFF_BASE_S", "2.5"))
 CG_RATE_LIMIT_COOLDOWN_S = float(os.getenv("CG_RATE_LIMIT_COOLDOWN_S", "75"))
 CG_CREDIT_EXHAUSTED_COOLDOWN_S = float(os.getenv("CG_CREDIT_EXHAUSTED_COOLDOWN_S", "43200"))
 CG_AUTH_FAILURE_COOLDOWN_S = float(os.getenv("CG_AUTH_FAILURE_COOLDOWN_S", "21600"))
+CG_WAIT_ON_ALL_KEYS_SUSPENDED = os.getenv("CG_WAIT_ON_ALL_KEYS_SUSPENDED", "1") == "1"
+CG_ALL_KEYS_MAX_WAIT_S = float(os.getenv("CG_ALL_KEYS_MAX_WAIT_S", "120"))
+CG_ALL_KEYS_WAIT_PAD_S = float(os.getenv("CG_ALL_KEYS_WAIT_PAD_S", "0.25"))
+CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END = os.getenv("CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END", "1") == "1"
 
 
 def _parse_csv_env(raw: Optional[str]) -> list[str]:
@@ -349,6 +521,23 @@ def _is_credit_exhaustion_text(text: str) -> bool:
     return True
 
 
+def _is_monthly_credit_exhaustion_text(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    has_credit_like = any(tok in t for tok in ("credit", "credits", "quota", "allowance", "usage cap", "plan limit"))
+    has_month_like = any(tok in t for tok in ("monthly", "month", "billing cycle", "next month", "resets"))
+    return has_credit_like and has_month_like
+
+
+def _seconds_until_next_utc_month() -> float:
+    now = now_utc()
+    year = now.year + (1 if now.month == 12 else 0)
+    month = 1 if now.month == 12 else now.month + 1
+    next_month = datetime(year, month, 1, tzinfo=UTC)
+    return max(1.0, (next_month - now).total_seconds())
+
+
 def _extract_error_text(resp: requests.Response) -> str:
     text = ""
     try:
@@ -382,7 +571,18 @@ def _load_api_keys() -> list[str]:
             if k and k not in disabled and k not in keys:
                 keys.append(k)
 
-    for env_name in ("COINGECKO_API_KEY_AA", "COINGECKO_API_KEY_BB", "COINGECKO_API_KEY_CC", "COINGECKO_API_KEY"):
+    preferred = [
+        "COINGECKO_API_KEY_AA",
+        "COINGECKO_API_KEY_BB",
+        "COINGECKO_API_KEY_CC",
+        "COINGECKO_API_KEY_DD",
+        "COINGECKO_API_KEY",
+    ]
+    extras = sorted(
+        n for n in os.environ.keys()
+        if n.startswith("COINGECKO_API_KEY_") and n not in preferred
+    )
+    for env_name in preferred + extras:
         k = (os.getenv(env_name) or "").strip()
         if k and k not in disabled and k not in keys:
             keys.append(k)
@@ -394,7 +594,8 @@ class KeyPool:
     def __init__(self, keys: list[str], req_interval_s: float, max_rpm: int):
         if not keys:
             raise RuntimeError(
-                "No CoinGecko API key found. Set COINGECKO_API_KEY_AA/BB/CC, COINGECKO_API_KEY, or COINGECKO_API_KEYS."
+                "No CoinGecko API key found. Set COINGECKO_API_KEY_AA/BB/CC/DD, "
+                "COINGECKO_API_KEY, COINGECKO_API_KEY_* or COINGECKO_API_KEYS."
             )
         self.keys = keys
         self.req_interval_s = req_interval_s
@@ -447,15 +648,23 @@ class KeyPool:
     def note_response(self, key: str, status_code: int, err_text: str) -> None:
         txt = (err_text or "").strip()
 
+        def _credit_suspend(reason_prefix: str) -> None:
+            cooldown = max(1.0, CG_CREDIT_EXHAUSTED_COOLDOWN_S)
+            reason = "credit_exhausted"
+            if CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END and _is_monthly_credit_exhaustion_text(txt):
+                cooldown = max(cooldown, _seconds_until_next_utc_month() + 60.0)
+                reason = "credit_exhausted_monthly"
+            self.suspend(key, cooldown, reason if not reason_prefix else f"{reason_prefix}_{reason}")
+
         if status_code == 429:
             if _is_credit_exhaustion_text(txt):
-                self.suspend(key, CG_CREDIT_EXHAUSTED_COOLDOWN_S, "credit_exhausted")
+                _credit_suspend("")
             else:
                 self.suspend(key, CG_RATE_LIMIT_COOLDOWN_S, "rate_limited")
             return
 
         if status_code in (402, 403) and _is_credit_exhaustion_text(txt):
-            self.suspend(key, CG_CREDIT_EXHAUSTED_COOLDOWN_S, f"http_{status_code}_credit_exhausted")
+            _credit_suspend(f"http_{status_code}")
             return
 
         if status_code == 401:
@@ -469,23 +678,48 @@ class KeyPool:
             idx = self._rr % len(self.keys)
             self._rr += 1
 
-        usable_idx, next_wait = self._pick_available_index(idx)
-        if usable_idx is None:
+        deadline = time.time() + max(0.0, CG_ALL_KEYS_MAX_WAIT_S)
+        wait_logged = False
+        while True:
+            usable_idx, next_wait = self._pick_available_index(idx)
+            if usable_idx is not None:
+                key = self.keys[usable_idx]
+                self._throttle(key)
+                self._times[key].append(time.time())
+                return key
+
             details = []
+            short_term_waits: list[float] = []
             now = time.time()
             for key_i in self.keys:
                 wait_s = max(0.0, self._suspend_until.get(key_i, 0.0) - now)
                 reason = self._suspend_reason.get(key_i, "") or "unknown"
                 details.append(f"{_mask_key(key_i)}={int(wait_s)}s({reason})")
+                if wait_s > 0 and reason in ("rate_limited", "unknown"):
+                    short_term_waits.append(wait_s)
+
+            remaining = deadline - now
+            can_wait = (
+                CG_WAIT_ON_ALL_KEYS_SUSPENDED
+                and len(short_term_waits) > 0
+                and remaining > 0
+            )
+            if can_wait:
+                sleep_for = min(min(short_term_waits) + max(0.0, CG_ALL_KEYS_WAIT_PAD_S), remaining)
+                sleep_for = max(0.1, sleep_for)
+                if not wait_logged:
+                    print(
+                        f"[{now_str()}] [cg] all keys temporarily suspended; "
+                        f"waiting {sleep_for:.1f}s before retry. details: {', '.join(details)}"
+                    )
+                    wait_logged = True
+                time.sleep(sleep_for)
+                continue
+
             raise RuntimeError(
                 "All CoinGecko keys are temporarily suspended; "
                 f"next key available in {max(1, int(next_wait))}s; details: {', '.join(details)}"
             )
-
-        key = self.keys[usable_idx]
-        self._throttle(key)
-        self._times[key].append(time.time())
-        return key
 
 
 _KEY_POOL: Optional[KeyPool] = None
@@ -504,7 +738,20 @@ def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional
     last_err: Optional[Exception] = None
 
     for attempt in range(1, CG_RETRIES + 1):
-        key = _get_key_pool().reserve(hint=hint, retry_offset=(attempt - 1))
+        try:
+            key = _get_key_pool().reserve(hint=hint, retry_offset=(attempt - 1))
+        except RuntimeError as exc:
+            last_err = exc
+            if attempt >= CG_RETRIES:
+                break
+            wait_s = CG_BACKOFF_BASE_S * attempt + random.uniform(0.0, 0.5)
+            print(
+                f"[{now_str()}] [cg] {path} reserve error: {exc}; "
+                f"retry in {wait_s:.1f}s ({attempt}/{CG_RETRIES})"
+            )
+            time.sleep(wait_s)
+            continue
+
         req_params = dict(base_params)
         headers: dict[str, str] = {}
 

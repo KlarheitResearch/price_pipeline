@@ -9,6 +9,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_HOURLY,
@@ -160,6 +161,11 @@ def main() -> None:
     daily_first = target_day - timedelta(days=DAILY_WINDOW_DAYS - 1)
 
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "91_update_coin_data_availability")
+    tracker.set_metric("daily_window_days", DAILY_WINDOW_DAYS)
+    tracker.set_metric("intraday_10m_days", INTRADAY_10M_DAYS)
+    tracker.set_metric("intraday_hourly_days", INTRADAY_HOURLY_DAYS)
+    tracker.start()
     try:
         sel_live = SimpleStatement(
             f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
@@ -169,7 +175,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         print(
             f"[{now_str()}] Availability update: scope={scope_label()} coins={len(coins)} "
@@ -407,6 +417,13 @@ def main() -> None:
             f"[{now_str()}] Availability done. wrote_daily_rows={wrote_daily} "
             f"wrote_daily_ranges={wrote_ranges} wrote_intraday_rows={wrote_intraday}"
         )
+        tracker.set_metric("rows_daily", wrote_daily)
+        tracker.set_metric("rows_daily_ranges", wrote_ranges)
+        tracker.set_metric("rows_intraday", wrote_intraday)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

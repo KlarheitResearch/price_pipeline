@@ -8,6 +8,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_DAILY,
     TABLE_LIVE,
     TABLE_MONTHLY,
@@ -146,6 +147,9 @@ def apply_live_partial(agg, live_row):
 def main() -> None:
     hb = Heartbeat("EG_build_monthly_from_daily")
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "EG_build_monthly_from_daily")
+    tracker.set_metric("monthly_finalize_lookback", MONTHLY_FINALIZE_LOOKBACK)
+    tracker.start()
     try:
         sel_live = SimpleStatement(
             f"""
@@ -159,7 +163,11 @@ def main() -> None:
         coins = select_coins_from_live_rows(live_rows)
         if not coins:
             print(f"[{now_str()}] No scoped coins in {TABLE_LIVE} for {scope_label()}; run AA_load_live_selected.py first.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         sel_daily = session.prepare(
             f"""
@@ -300,6 +308,11 @@ def main() -> None:
             wrote += 1
 
         print(f"[{now_str()}] Done. monthly_writes={wrote}")
+        tracker.set_metric("rows_monthly", wrote)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()

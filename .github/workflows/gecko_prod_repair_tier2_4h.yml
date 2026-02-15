@@ -94,7 +94,9 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+          PP_LIVE_PROJECT_PARTIALS: "0"
         run: python prices/prod_pipeline/AA_load_live_selected.py
 
       - name: Tier2 repair (rank 201-600)
@@ -107,6 +109,7 @@ jobs:
           COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
           PP_REPAIR_10M_HOURS: "12"
           PP_REPAIR_INTERPOLATE: "1"
@@ -121,4 +124,3 @@ jobs:
           PP_REPAIR_RUN_MCAP: "0"
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/92_repair_timeseries.py
-

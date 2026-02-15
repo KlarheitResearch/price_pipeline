@@ -11,6 +11,7 @@ from cassandra.query import SimpleStatement
 
 from common import (
     Heartbeat,
+    PipelineHealthTracker,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_HOURLY,
@@ -58,6 +59,12 @@ def rank_map(cat_to_mcap: dict[str, float]) -> dict[str, int]:
 def main() -> None:
     hb = Heartbeat("HH_write_market_caps")
     session, cluster = connect_astra()
+    tracker = PipelineHealthTracker(session, "HH_write_market_caps")
+    tracker.set_metric("top_n", PP_TOP_N)
+    tracker.set_metric("mcap_10m_slots", MCAP_10M_SLOTS)
+    tracker.set_metric("mcap_hours", MCAP_HOURS)
+    tracker.set_metric("mcap_days", MCAP_DAYS)
+    tracker.start()
     try:
         sel_live = SimpleStatement(
             f"SELECT id, category, market_cap_rank FROM {TABLE_LIVE}",
@@ -69,7 +76,11 @@ def main() -> None:
         coins = live_rows[:PP_TOP_N]
         if not coins:
             print(f"[{now_str()}] No ranked rows in {TABLE_LIVE}.")
+            tracker.mark_noop()
+            tracker.set_metric("coins_scoped", 0)
+            tracker.finish("noop")
             return
+        tracker.set_metric("coins_scoped", len(coins))
 
         print(f"[{now_str()}] Recomputing market caps for {len(coins)} coin(s), TOP_N={PP_TOP_N}")
 
@@ -237,6 +248,13 @@ def main() -> None:
         hb.maybe(extra="flush_daily=done", force=True)
 
         print(f"[{now_str()}] mcap writes: 10m={wrote10} hourly={wroteH} daily={wroteD}")
+        tracker.set_metric("rows_mcap_10m", wrote10)
+        tracker.set_metric("rows_mcap_hourly", wroteH)
+        tracker.set_metric("rows_mcap_daily", wroteD)
+        tracker.finish("success")
+    except Exception as exc:
+        tracker.finish("failed", f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         try:
             cluster.shutdown()
