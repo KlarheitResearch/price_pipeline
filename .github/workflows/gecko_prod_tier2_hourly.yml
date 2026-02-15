@@ -15,7 +15,7 @@ on:
       run_mcap:
         description: "Run HH_write_market_caps.py"
         required: false
-        default: "true"
+        default: "false"
       run_derivatives:
         description: "Run BB_refresh_live_derivatives.py"
         required: false
@@ -31,7 +31,7 @@ on:
       run_monthly:
         description: "Run EG_build_monthly_from_daily.py"
         required: false
-        default: "true"
+        default: "false"
       VERBOSE_MODE:
         description: "Verbose (0/1)"
         required: false
@@ -53,7 +53,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'schedule' || vars.ENABLE_GH_FALLBACK_SCHEDULE == '1' }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -152,7 +152,7 @@ jobs:
           COINGECKO_API_KEY_DD: ${{ secrets.COINGECKO_API_KEY_DD != '' && secrets.COINGECKO_API_KEY_DD || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
           PP_SLOT_DELAY_SEC: "90"
-          PP_CC_HEAL_RECENT_SLOTS: "3"
+          PP_CC_HEAL_RECENT_SLOTS: "1"
           PP_CC_HEAL_INTERPOLATE: "1"
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/CC_build_10m_intraday.py
