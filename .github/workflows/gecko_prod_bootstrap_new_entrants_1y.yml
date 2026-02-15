@@ -24,8 +24,10 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
-  schedule:
-    - cron: "23 3 * * *"
+  # GitHub schedule disabled (Cloudflare is primary trigger).
+  # Uncomment below to manually re-enable GitHub cron fallback.
+  # schedule:
+  #   - cron: "23 3 * * *"
 
 permissions:
   contents: read

@@ -3,8 +3,10 @@ name: gecko-prod-schedule-smoke
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "7-59/10 * * * *"
+  # GitHub schedule disabled (Cloudflare is primary trigger).
+  # Uncomment below to manually re-enable GitHub cron fallback.
+  # schedule:
+  #   - cron: "7-59/10 * * * *"
 
 permissions:
   contents: read

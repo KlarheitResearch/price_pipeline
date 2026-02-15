@@ -4,6 +4,10 @@ name: gecko-prod-repair-tier3-daily
 on:
   workflow_dispatch:
     inputs:
+      run_live_refresh:
+        description: "Run AA_load_live_selected.py before repair"
+        required: false
+        default: "true"
       run_repair:
         description: "Run 92_repair_timeseries.py"
         required: false
@@ -20,8 +24,10 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
-  schedule:
-    - cron: "55 2 * * *"
+  # GitHub schedule disabled (Cloudflare is primary trigger).
+  # Uncomment below to manually re-enable GitHub cron fallback.
+  # schedule:
+  #   - cron: "55 2 * * *"
 
 permissions:
   contents: read
@@ -41,6 +47,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
+      RUN_LIVE_REFRESH: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_live_refresh || 'true') }}
       RUN_REPAIR: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_repair || 'true') }}
       RUN_AVAIL: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_availability || 'true') }}
       RUN_AUDIT: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_audit || 'true') }}
@@ -86,6 +93,19 @@ jobs:
         run: |
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
           test -s secure-connect.zip
+
+      - name: Tier3 live refresh (rank 601-1000, repair pre-step)
+        if: env.RUN_LIVE_REFRESH == 'true'
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
+          COINGECKO_API_KEY_AA: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_BB: ${{ secrets.COINGECKO_API_KEY_BB != '' && secrets.COINGECKO_API_KEY_BB || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
+          VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+        run: python prices/prod_pipeline/AA_load_live_selected.py
 
       - name: Tier3 repair (rank 601-1000)
         if: env.RUN_REPAIR == 'true'
