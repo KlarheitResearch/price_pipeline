@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_MCAP_10M,
     TABLE_MCAP_DAILY,
     TABLE_MCAP_HOURLY,
@@ -29,6 +30,7 @@ def _days_since(start_iso: str) -> int:
 
 
 def main() -> None:
+    hb = Heartbeat("95_recompute_market_caps_full")
     daily_days = _days_since(FULL_DAILY_START)
     slots_10m = max(1, FULL_10M_DAYS * 24 * 6)
     hours = max(1, FULL_HOURLY_DAYS * 24)
@@ -41,10 +43,12 @@ def main() -> None:
 
     session, cluster = connect_astra()
     try:
+        hb.maybe(extra="phase=truncate_start", force=True)
         session.execute(SimpleStatement(f"TRUNCATE {TABLE_MCAP_10M}"), timeout=REQUEST_TIMEOUT_SEC)
         session.execute(SimpleStatement(f"TRUNCATE {TABLE_MCAP_HOURLY}"), timeout=REQUEST_TIMEOUT_SEC)
         session.execute(SimpleStatement(f"TRUNCATE {TABLE_MCAP_DAILY}"), timeout=REQUEST_TIMEOUT_SEC)
         print(f"[{now_str()}] Truncated {TABLE_MCAP_10M}, {TABLE_MCAP_HOURLY}, {TABLE_MCAP_DAILY}")
+        hb.maybe(extra="phase=truncate_done", force=True)
     finally:
         try:
             cluster.shutdown()

@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from collections import defaultdict
 
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_LIVE,
     TABLE_LIVE_RANKED,
     TABLE_MCAP_LIVE,
     connect_astra,
+    drain_async,
+    enqueue_async,
+    is_verbose,
     now_str,
+    should_log_progress,
     to_cassandra_ts,
     to_utc,
 )
@@ -21,6 +27,7 @@ REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 PP_TOP_N = int(os.getenv("PP_TOP_N", "1000"))
 RANK_BUCKET = (os.getenv("PP_RANK_BUCKET", "all") or "all").strip() or "all"
 SENTINEL_UNRANKED = int(os.getenv("PP_SENTINEL_UNRANKED", "2000000000"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 
 
 def _f(x):
@@ -41,8 +48,10 @@ def _rank_int(x):
 
 
 def main() -> None:
+    hb = Heartbeat("BB_refresh_live_derivatives")
     session, cluster = connect_astra()
     try:
+        print(f"[{now_str()}] Refresh derivatives start: top_n={PP_TOP_N} bucket={RANK_BUCKET}")
         sel_live = SimpleStatement(
             f"""
             SELECT id, symbol, name, category, market_cap_rank,
@@ -56,9 +65,12 @@ def main() -> None:
         if not rows:
             print(f"[{now_str()}] No rows in {TABLE_LIVE}; skip derivatives refresh.")
             return
+        print(f"[{now_str()}] Loaded {len(rows)} rows from {TABLE_LIVE}, sorting by rank...")
 
         rows.sort(key=lambda r: (_rank_int(getattr(r, "market_cap_rank", None)), getattr(r, "id", "")))
         ranked_rows = rows[:PP_TOP_N]
+        print(f"[{now_str()}] Ranked subset selected: {len(ranked_rows)}")
+        hb.maybe(extra="ranking=done", force=True)
 
         del_ranked = session.prepare(f"DELETE FROM {TABLE_LIVE_RANKED} WHERE bucket=?")
         ins_ranked = session.prepare(
@@ -70,10 +82,18 @@ def main() -> None:
             """
         )
         session.execute(del_ranked, [RANK_BUCKET], timeout=REQUEST_TIMEOUT_SEC)
+        print(f"[{now_str()}] Cleared ranked bucket '{RANK_BUCKET}' in {TABLE_LIVE_RANKED}")
 
         wrote_ranked = 0
-        for r in ranked_rows:
-            session.execute(
+        ranked_pending = deque()
+        for idx, r in enumerate(ranked_rows, 1):
+            if should_log_progress(idx, len(ranked_rows), default_every=100):
+                cid = getattr(r, "id", None)
+                print(f"[{now_str()}] ranked write {idx}/{len(ranked_rows)} -> {cid}")
+            hb.maybe(extra=f"ranked={idx}/{len(ranked_rows)}")
+            enqueue_async(
+                session,
+                ranked_pending,
                 ins_ranked,
                 [
                     RANK_BUCKET,
@@ -90,8 +110,11 @@ def main() -> None:
                     to_cassandra_ts(to_utc(getattr(r, "last_updated", None))) if getattr(r, "last_updated", None) is not None else None,
                 ],
                 timeout=REQUEST_TIMEOUT_SEC,
+                max_in_flight=ASTRA_MAX_IN_FLIGHT,
             )
             wrote_ranked += 1
+        drain_async(ranked_pending)
+        hb.maybe(extra="ranked_flush=done", force=True)
 
         totals = defaultdict(lambda: {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": None})
         for r in ranked_rows:
@@ -119,11 +142,19 @@ def main() -> None:
             """
         )
         session.execute(SimpleStatement(f"TRUNCATE {TABLE_MCAP_LIVE}"), timeout=REQUEST_TIMEOUT_SEC)
+        print(f"[{now_str()}] Truncated {TABLE_MCAP_LIVE}, writing category totals...")
 
         wrote_mcap = 0
-        for cat, vals in totals.items():
+        mcap_items = list(totals.items())
+        mcap_pending = deque()
+        for idx, (cat, vals) in enumerate(mcap_items, 1):
+            if is_verbose() and should_log_progress(idx, len(mcap_items), default_every=10):
+                print(f"[{now_str()}] mcap write {idx}/{len(mcap_items)} -> {cat}")
+            hb.maybe(extra=f"mcap={idx}/{len(mcap_items)}")
             lu = vals["last_updated"]
-            session.execute(
+            enqueue_async(
+                session,
+                mcap_pending,
                 ins_mcap_live,
                 [
                     cat,
@@ -133,8 +164,11 @@ def main() -> None:
                     float(vals["volume_24h"]),
                 ],
                 timeout=REQUEST_TIMEOUT_SEC,
+                max_in_flight=ASTRA_MAX_IN_FLIGHT,
             )
             wrote_mcap += 1
+        drain_async(mcap_pending)
+        hb.maybe(extra="mcap_flush=done", force=True)
 
         print(
             f"[{now_str()}] Refreshed derivatives from {TABLE_LIVE}: "

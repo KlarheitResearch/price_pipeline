@@ -26,6 +26,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'schedule' || vars.ENABLE_GH_FALLBACK_SCHEDULE == '1' }}
     timeout-minutes: 12
     env:
       TZ: UTC
@@ -36,8 +37,24 @@ jobs:
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       PP_RANK_START: "1"
       PP_RANK_END: "200"
-      PP_TEST_MODE_UNTIL_UTC: "2026-02-16T23:59:59Z"
+      PP_TEST_MODE_UNTIL_UTC: ""
+      PP_FORCE_TEST_MODE: "0"
       PP_TEST_COIN_IDS: "bitcoin,ethereum"
+      PP_TABLE_LIVE: "gecko_prices_live"
+      PP_TABLE_LIVE_RANKED: "gecko_prices_live_ranked"
+      PP_TABLE_ROLLING: "gecko_prices_live_rolling"
+      PP_TABLE_10M: "gecko_prices_10m_7d"
+      PP_TABLE_HOURLY: "gecko_candles_hourly_30d"
+      PP_TABLE_DAILY: "gecko_candles_daily_contin"
+      PP_TABLE_MONTHLY: "gecko_candles_monthly"
+      PP_TABLE_MCAP_LIVE: "gecko_market_cap_live"
+      PP_TABLE_MCAP_10M: "gecko_market_cap_10m_7d"
+      PP_TABLE_MCAP_HOURLY: "gecko_market_cap_hourly_30d"
+      PP_TABLE_MCAP_DAILY: "gecko_market_cap_daily_contin"
+      PP_TABLE_DAILY_RANGES: "coin_daily_coverage_ranges"
+      PP_TABLE_DAILY_AVAIL: "coin_daily_availability"
+      PP_TABLE_INTRADAY_COV: "coin_intraday_coverage"
+      PP_TABLE_JOB_LOCKS: "job_locks"
     steps:
       - uses: actions/checkout@v4
 
@@ -72,3 +89,4 @@ jobs:
           COINGECKO_API_KEY_CC: ${{ secrets.COINGECKO_API_KEY_CC != '' && secrets.COINGECKO_API_KEY_CC || secrets.COINGECKO_API_KEY }}
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
         run: python prices/prod_pipeline/AA_load_live_selected.py
+

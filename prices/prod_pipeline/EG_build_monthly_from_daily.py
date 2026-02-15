@@ -7,12 +7,14 @@ from datetime import date, timedelta
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_DAILY,
     TABLE_LIVE,
     TABLE_MONTHLY,
     connect_astra,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -142,6 +144,7 @@ def apply_live_partial(agg, live_row):
 
 
 def main() -> None:
+    hb = Heartbeat("EG_build_monthly_from_daily")
     session, cluster = connect_astra()
     try:
         sel_live = SimpleStatement(
@@ -190,7 +193,10 @@ def main() -> None:
         print(f"[{now_str()}] Monthly run for scope={scope_label()} coins={len(coins)}")
 
         wrote = 0
-        for coin in coins:
+        for idx, coin in enumerate(coins, 1):
+            if should_log_progress(idx, len(coins), default_every=25):
+                print(f"[{now_str()}] coin {idx}/{len(coins)} -> {coin.id}")
+            hb.maybe(extra=f"coin={idx}/{len(coins)}")
             # Closed months: finalize from daily data only (stable once finalized).
             for k in range(1, MONTHLY_FINALIZE_LOOKBACK + 1):
                 month_start = month_start_offset(curr_start, k)

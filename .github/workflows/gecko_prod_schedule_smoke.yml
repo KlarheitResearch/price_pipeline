@@ -12,9 +12,11 @@ permissions:
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'schedule' || vars.ENABLE_GH_FALLBACK_SCHEDULE == '1' }}
     timeout-minutes: 5
     steps:
       - name: UTC now
         run: |
           echo "schedule-smoke fired"
           date -u +"%Y-%m-%d %H:%M:%S UTC"
+

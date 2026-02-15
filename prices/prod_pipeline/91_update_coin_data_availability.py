@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from datetime import datetime, date, timedelta
 
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_HOURLY,
     TABLE_LIVE,
     UTC,
     connect_astra,
+    drain_async,
+    enqueue_async,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -23,6 +28,7 @@ from common import (
 
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 RUN_DAILY = os.getenv("PP_AVAIL_RUN_DAILY", "1") == "1"
 RUN_INTRADAY = os.getenv("PP_AVAIL_RUN_INTRADAY", "1") == "1"
 DAILY_WINDOW_DAYS = int(os.getenv("PP_AVAIL_DAILY_WINDOW_DAYS", "365"))
@@ -256,6 +262,7 @@ def main() -> None:
         wrote_ranges = 0
         wrote_daily = 0
         wrote_intraday = 0
+        hb = Heartbeat("91_update_coin_data_availability")
 
         now_ts = now_utc()
         start_10m = (now_ts - timedelta(days=INTRADAY_10M_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -264,8 +271,10 @@ def main() -> None:
         end_1h = now_ts + timedelta(hours=1)
 
         for idx, coin in enumerate(coins, 1):
-            if idx == 1 or idx % LOG_EVERY == 0 or idx == len(coins):
+            if should_log_progress(idx, len(coins), default_every=LOG_EVERY):
                 print(f"[{now_str()}] coin {idx}/{len(coins)} -> {coin.id}")
+            hb.maybe(extra=f"coin={idx}/{len(coins)}")
+            pending = deque()
 
             if RUN_DAILY:
                 rows = list(
@@ -303,14 +312,19 @@ def main() -> None:
 
                 session.execute(del_daily_ranges, [coin.id], timeout=REQUEST_TIMEOUT_SEC)
                 for sday, eday in ranges:
-                    session.execute(
+                    enqueue_async(
+                        session,
+                        pending,
                         ins_daily_range,
                         [coin.id, sday, eday, to_cassandra_ts(now_ts)],
                         timeout=REQUEST_TIMEOUT_SEC,
+                        max_in_flight=ASTRA_MAX_IN_FLIGHT,
                     )
                     wrote_ranges += 1
 
-                session.execute(
+                enqueue_async(
+                    session,
+                    pending,
                     ins_daily_avail,
                     [
                         coin.id,
@@ -331,6 +345,7 @@ def main() -> None:
                         _open_range_start(have_any, target_day),
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 wrote_daily += 1
 
@@ -350,10 +365,13 @@ def main() -> None:
                     set_count = _popcount(bm)
                     if set_count <= 0:
                         continue
-                    session.execute(
+                    enqueue_async(
+                        session,
+                        pending,
                         ins_intraday_10m,
                         [coin.id, G_10M, d, bm, int(set_count), to_cassandra_ts(entry["first_seen"]), to_cassandra_ts(entry["last_seen"])],
                         timeout=REQUEST_TIMEOUT_SEC,
+                        max_in_flight=ASTRA_MAX_IN_FLIGHT,
                     )
                     wrote_intraday += 1
 
@@ -372,12 +390,18 @@ def main() -> None:
                     set_count = _popcount(bm)
                     if set_count <= 0:
                         continue
-                    session.execute(
+                    enqueue_async(
+                        session,
+                        pending,
                         ins_intraday_1h,
                         [coin.id, G_1H, d, bm, int(set_count), to_cassandra_ts(entry["first_seen"]), to_cassandra_ts(entry["last_seen"])],
                         timeout=REQUEST_TIMEOUT_SEC,
+                        max_in_flight=ASTRA_MAX_IN_FLIGHT,
                     )
                     wrote_intraday += 1
+
+            drain_async(pending)
+            hb.maybe(extra=f"coin={idx}/{len(coins)} flush=done", force=True)
 
         print(
             f"[{now_str()}] Availability done. wrote_daily_rows={wrote_daily} "

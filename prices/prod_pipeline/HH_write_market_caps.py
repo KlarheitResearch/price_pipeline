@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from collections import defaultdict
 from datetime import timedelta
 from typing import Any
@@ -9,14 +10,18 @@ from typing import Any
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_HOURLY,
     connect_astra,
+    drain_async,
+    enqueue_async,
     floor_10m,
     floor_hour,
     now_str,
     now_utc,
+    should_log_progress,
     to_cassandra_ts,
     to_utc,
 )
@@ -32,6 +37,7 @@ MCAP_10M_SLOTS = int(os.getenv("PP_MCAP_10M_SLOTS", "12"))
 MCAP_HOURS = int(os.getenv("PP_MCAP_HOURS", "24"))
 MCAP_DAYS = int(os.getenv("PP_MCAP_DAYS", "7"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 
 
 def _f(x):
@@ -50,6 +56,7 @@ def rank_map(cat_to_mcap: dict[str, float]) -> dict[str, int]:
 
 
 def main() -> None:
+    hb = Heartbeat("HH_write_market_caps")
     session, cluster = connect_astra()
     try:
         sel_live = SimpleStatement(
@@ -136,8 +143,9 @@ def main() -> None:
         for idx, coin in enumerate(coins, 1):
             cid = coin.id
             cat = (getattr(coin, "category", None) or "Other").strip() or "Other"
-            if idx % 100 == 0 or idx == 1 or idx == len(coins):
+            if should_log_progress(idx, len(coins), default_every=100):
                 print(f"[{now_str()}] coin {idx}/{len(coins)} -> {cid}")
+            hb.maybe(extra=f"coin={idx}/{len(coins)}")
 
             rows10 = session.execute(
                 sel_10m,
@@ -177,38 +185,56 @@ def main() -> None:
 
         wrote10 = wroteH = wroteD = 0
 
+        p10 = deque()
         for ts, cats in sorted(agg10.items()):
             ranks = rank_map({c: vals["mcap"] for c, vals in cats.items()})
             for c, vals in cats.items():
                 lu = vals["lu"] or ts
-                session.execute(
+                enqueue_async(
+                    session,
+                    p10,
                     ins_10m,
                     [c, to_cassandra_ts(ts), to_cassandra_ts(lu), float(vals["mcap"]), ranks.get(c), float(vals["vol"])],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 wrote10 += 1
+        drain_async(p10)
+        hb.maybe(extra="flush_10m=done", force=True)
 
+        pH = deque()
         for ts, cats in sorted(aggH.items()):
             ranks = rank_map({c: vals["mcap"] for c, vals in cats.items()})
             for c, vals in cats.items():
                 lu = vals["lu"] or ts
-                session.execute(
+                enqueue_async(
+                    session,
+                    pH,
                     ins_hourly,
                     [c, to_cassandra_ts(ts), to_cassandra_ts(lu), float(vals["mcap"]), ranks.get(c), float(vals["vol"])],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 wroteH += 1
+        drain_async(pH)
+        hb.maybe(extra="flush_hourly=done", force=True)
 
+        pD = deque()
         for d, cats in sorted(aggD.items()):
             ranks = rank_map({c: vals["mcap"] for c, vals in cats.items()})
             for c, vals in cats.items():
                 lu = vals["lu"] or now_ts
-                session.execute(
+                enqueue_async(
+                    session,
+                    pD,
                     ins_daily,
                     [c, d, to_cassandra_ts(lu), float(vals["mcap"]), ranks.get(c), float(vals["vol"])],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 wroteD += 1
+        drain_async(pD)
+        hb.maybe(extra="flush_daily=done", force=True)
 
         print(f"[{now_str()}] mcap writes: 10m={wrote10} hourly={wroteH} daily={wroteD}")
     finally:
@@ -220,4 +246,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

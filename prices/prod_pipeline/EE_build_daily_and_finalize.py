@@ -7,6 +7,7 @@ from datetime import timedelta
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_10M,
     TABLE_DAILY,
     TABLE_LIVE,
@@ -18,6 +19,7 @@ from common import (
     last_value_in_window,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -100,6 +102,7 @@ def build_day_from_10m(rows, day_start, day_end):
 
 
 def main() -> None:
+    hb = Heartbeat("EE_build_daily_and_finalize")
     session, cluster = connect_astra()
     try:
         sel_live = SimpleStatement(
@@ -148,7 +151,18 @@ def main() -> None:
 
         print(f"[{now_str()}] Daily run for scope={scope_label()} coins={len(coins)}")
 
-        for coin in coins:
+        for idx, coin in enumerate(coins, 1):
+            if should_log_progress(idx, len(coins), default_every=25):
+                print(f"[{now_str()}] coin {idx}/{len(coins)} -> {coin.id}")
+            hb.maybe(extra=f"coin={idx}/{len(coins)}")
+
+            api_finalize_data = None
+            if DAILY_FINALIZE_LOOKBACK_DAYS > 0:
+                api_window_start = today_start - timedelta(days=DAILY_FINALIZE_LOOKBACK_DAYS)
+                try:
+                    api_finalize_data = cg_market_chart_range(coin.id, api_window_start, today_start, vs_currency="usd")
+                except Exception as exc:
+                    print(f"[{now_str()}] [warn] API finalize preload failed for {coin.id}: {exc}")
             # 1) Build/update today partial from 10m
             if today_effective_end > today_start:
                 rows = list(
@@ -208,13 +222,10 @@ def main() -> None:
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
 
-                try:
-                    data = cg_market_chart_range(coin.id, day_start, day_end, vs_currency="usd")
-                except Exception as exc:
-                    print(f"[{now_str()}] [warn] API finalize failed for {coin.id} {day_key}: {exc}")
+                if api_finalize_data is None:
                     continue
 
-                prices = extract_series_in_window(data.get("prices", []) or [], day_start, day_end)
+                prices = extract_series_in_window(api_finalize_data.get("prices", []) or [], day_start, day_end)
                 if not prices:
                     continue
                 price_values = [v for _, v in prices]
@@ -223,8 +234,8 @@ def main() -> None:
                 high = max(price_values)
                 low = min(price_values)
                 last_price_ts = prices[-1][0]
-                mcap, _ = last_value_in_window(data.get("market_caps", []) or [], day_start, day_end)
-                vol, _ = last_value_in_window(data.get("total_volumes", []) or [], day_start, day_end)
+                mcap, _ = last_value_in_window(api_finalize_data.get("market_caps", []) or [], day_start, day_end)
+                vol, _ = last_value_in_window(api_finalize_data.get("total_volumes", []) or [], day_start, day_end)
 
                 session.execute(
                     ins_daily,

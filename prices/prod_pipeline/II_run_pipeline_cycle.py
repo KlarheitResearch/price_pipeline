@@ -5,10 +5,11 @@ import pathlib
 import subprocess
 import sys
 
-from common import now_str, get_test_coin_ids
+from common import Heartbeat, get_test_coin_ids, now_str, should_log_progress
 
 
 def main() -> None:
+    hb = Heartbeat("II_run_pipeline_cycle")
     base = pathlib.Path(__file__).resolve().parent
     scripts = [
         "AA_load_live_selected.py",
@@ -21,9 +22,11 @@ def main() -> None:
     ]
 
     print(f"[{now_str()}] Starting prod_pipeline top2 cycle for {get_test_coin_ids()}")
-    for script in scripts:
+    for idx, script in enumerate(scripts, 1):
+        if should_log_progress(idx, len(scripts), default_every=1):
+            print(f"[{now_str()}] step {idx}/{len(scripts)} -> {script}")
+        hb.maybe(extra=f"step={idx}/{len(scripts)}")
         path = base / script
-        print(f"[{now_str()}] -> running {script}")
         subprocess.run([sys.executable, str(path)], check=True)
     print(f"[{now_str()}] Cycle complete.")
 

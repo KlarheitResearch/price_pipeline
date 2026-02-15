@@ -8,12 +8,14 @@ from collections import defaultdict
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_10M,
     TABLE_LIVE,
     UTC,
     connect_astra,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -79,8 +81,12 @@ def main() -> None:
         )
 
         total_with_gaps = 0
+        hb = Heartbeat("90_audit_10m_gaps")
         worst: list[tuple[int, str, str]] = []
         for i, coin in enumerate(coins, 1):
+            if should_log_progress(i, len(coins), default_every=50):
+                print(f"[{now_str()}] coin {i}/{len(coins)} -> {coin.id}")
+            hb.maybe(extra=f"coin={i}/{len(coins)}")
             rows = session.execute(
                 sel_10m,
                 [coin.id, to_cassandra_ts(start_dt), to_cassandra_ts(end_excl)],

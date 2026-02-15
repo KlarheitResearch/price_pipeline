@@ -20,6 +20,9 @@ if str(_BACKEND_ROOT) not in sys.path:
 
 from astra_connect.connect import get_session, AstraConfig
 
+# Load .env early so verbosity/table envs are available during module import.
+AstraConfig.from_env()
+
 
 UTC = timezone.utc
 
@@ -30,6 +33,74 @@ def now_utc() -> datetime:
 
 def now_str() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def is_verbose() -> bool:
+    return _env_flag("VERBOSE_PRINTS", False) or _env_flag("PP_VERBOSE_PRINTS", False)
+
+
+def heartbeat_sec() -> int:
+    return max(5, int(os.getenv("PP_HEARTBEAT_SEC", "20")))
+
+
+def progress_every_verbose() -> int:
+    return max(1, int(os.getenv("PP_PROGRESS_EVERY", "10")))
+
+
+# Backward-compatible constant for scripts importing VERBOSE_PRINTS directly.
+VERBOSE_PRINTS = is_verbose()
+
+
+def should_log_progress(idx: int, total: int, default_every: int = 100) -> bool:
+    if total <= 0:
+        return True
+    if idx <= 1 or idx >= total:
+        return True
+    every = progress_every_verbose() if is_verbose() else max(1, int(default_every))
+    return idx % every == 0
+
+
+class Heartbeat:
+    def __init__(self, label: str, interval_sec: Optional[int] = None):
+        self.label = label
+        self.interval_sec = max(5, int(interval_sec if interval_sec is not None else heartbeat_sec()))
+        now_mono = time.monotonic()
+        self._started = now_mono
+        self._last = now_mono
+
+    def maybe(self, extra: Optional[str] = None, *, force: bool = False) -> None:
+        if not is_verbose():
+            return
+        now_mono = time.monotonic()
+        if not force and (now_mono - self._last) < self.interval_sec:
+            return
+        elapsed = int(now_mono - self._started)
+        suffix = f" {extra}" if extra else ""
+        print(f"[{now_str()}] [heartbeat] {self.label} alive elapsed={elapsed}s{suffix}")
+        self._last = now_mono
+
+
+def enqueue_async(session, pending: deque, query, params, *, timeout: Optional[float] = None, max_in_flight: int = 64) -> None:
+    pending.append(session.execute_async(query, params, timeout=timeout))
+    while len(pending) >= max(1, int(max_in_flight)):
+        pending.popleft().result()
+
+
+def drain_async(pending: deque) -> None:
+    while pending:
+        pending.popleft().result()
+
+
+def vprint(msg: str) -> None:
+    if is_verbose():
+        print(f"[{now_str()}] {msg}")
 
 
 def to_utc(ts: Optional[datetime]) -> Optional[datetime]:
@@ -219,8 +290,6 @@ def connect_astra():
     AstraConfig.from_env()
     return get_session(return_cluster=True)
 
-
-AstraConfig.from_env()
 
 API_TIER = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()
 API_BASE = os.getenv(

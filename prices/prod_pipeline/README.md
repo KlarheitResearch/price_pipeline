@@ -112,7 +112,9 @@ Purpose:
 How it works:
 - processes last `PP_SLOTS_BACKFILL` slots
 - uses live points inside slot for OHLC when present
-- if slot is empty, carries previous value (`carry_prev`)
+- if slot is empty, attempts immediate API heal for recent slots (`PP_CC_HEAL_RECENT_SLOTS`, default `3`)
+- if still empty, carries previous value (`carry_prev`)
+- write quality guard prevents downgrading an existing stronger row (e.g. `repair_api_points`) with weaker data
 
 Why it exists:
 - gives fast intraday continuity and low-latency candle updates before API-finalized higher frames.
@@ -203,18 +205,20 @@ Why it exists:
 
 ### `92_repair_timeseries.py`
 Purpose:
-- repair missing recent 10m slots from CoinGecko market-chart data.
+- repair recent 10m slots from CoinGecko market-chart data.
 
 How it works:
 - scans missing slots in recent window (`PP_REPAIR_10M_HOURS`)
+- optionally re-targets existing non-API rows in-window (`PP_REPAIR_REWRITE_NON_API=1`, default on)
 - fills from in-slot API points when available
 - optional interpolation/carry fallback
+- downgrade guard skips overwriting stronger existing rows with weaker fallback output
 - writes with repair `candle_source`
 - optional follow-up finalize/recompute steps
 - optional distributed lock via `pp_job_locks`
 
 Why it exists:
-- handles short outages/gaps quickly without large historical backfills.
+- handles short outages/gaps quickly and upgrades temporary non-API rows toward API-backed 10m data.
 
 ### `93_backfill_monthly_from_daily.py`
 Purpose:
@@ -287,6 +291,11 @@ Temporary parallel-run scope override:
 
 All call lettered runtime entrypoints so execution order is explicit in logs and config.
 
+Cloudflare-triggered production mode:
+- keep workflow `schedule:` blocks as hot-standby only
+- set repo variable `ENABLE_GH_FALLBACK_SCHEDULE=0` (default) to prevent duplicate scheduled runs
+- if Cloudflare triggering is unavailable, set `ENABLE_GH_FALLBACK_SCHEDULE=1` to re-enable GitHub scheduled execution without code changes
+
 ## API Key Strategy
 
 CoinGecko keys are loaded in this order:
@@ -313,6 +322,16 @@ Request-key selection behavior:
 3. 10m can be quickly repaired (`92`) without full backfills.
 4. Category aggregates are recomputed from coin-level tables, not guessed.
 
+## Verbose Runtime Logging
+
+All prod scripts now support shared verbose progress + heartbeat logging.
+
+- `VERBOSE_PRINTS=true` enables high-frequency progress logs and heartbeats.
+- `PP_HEARTBEAT_SEC` controls heartbeat cadence (default `20` seconds).
+- `PP_PROGRESS_EVERY` controls verbose progress frequency (default every `10` items).
+- `PP_ASTRA_MAX_IN_FLIGHT` caps concurrent async Astra writes in heavy writers like `AA` and `BB` (default `64`).
+- `.env` is loaded at module import; make sure `.env` changes are saved before launching a script.
+
 ## Typical Commands
 
 Top2 smoke cycle:
@@ -328,6 +347,7 @@ Scoped tier test:
 $env:PP_RANK_START='201'
 $env:PP_RANK_END='600'
 $env:PP_SLOTS_BACKFILL='6'
+$env:PP_CC_HEAL_RECENT_SLOTS='3'
 python backend/prices/prod_pipeline/AA_load_live_selected.py
 python backend/prices/prod_pipeline/BB_refresh_live_derivatives.py
 python backend/prices/prod_pipeline/CC_build_10m_intraday.py
@@ -346,6 +366,7 @@ $env:PP_REPAIR_10M_HOURS='24'
 $env:PP_REPAIR_RUN_HOURLY='1'
 $env:PP_REPAIR_RUN_DAILY='1'
 $env:PP_REPAIR_RUN_MCAP='1'
+$env:PP_REPAIR_REWRITE_NON_API='1'
 python backend/prices/prod_pipeline/92_repair_timeseries.py
 ```
 

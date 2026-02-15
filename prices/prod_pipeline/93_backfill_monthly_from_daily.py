@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from datetime import date, datetime, timedelta
 
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_DAILY,
     TABLE_LIVE,
     TABLE_MONTHLY,
     connect_astra,
+    drain_async,
+    enqueue_async,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -21,6 +26,7 @@ from common import (
 
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 INCLUDE_ALL_DAILY_IDS = os.getenv("PP_BACKFILL_INCLUDE_ALL_DAILY_IDS", "1") == "1"
 CLEAR_PARTITION_FIRST = os.getenv("PP_MONTHLY_BACKFILL_CLEAR", "0") == "1"
 LOG_EVERY = int(os.getenv("PP_MONTHLY_BACKFILL_LOG_EVERY", "50"))
@@ -164,10 +170,12 @@ def main() -> None:
         )
 
         wrote = 0
+        hb = Heartbeat("93_backfill_monthly_from_daily")
         for idx, cid in enumerate(sorted(meta.keys()), 1):
             coin = meta[cid]
-            if idx == 1 or idx % LOG_EVERY == 0 or idx == len(meta):
+            if should_log_progress(idx, len(meta), default_every=LOG_EVERY):
                 print(f"[{now_str()}] coin {idx}/{len(meta)} -> {cid}")
+            hb.maybe(extra=f"coin={idx}/{len(meta)}")
 
             rows = list(session.execute(sel_daily_all, [cid], timeout=REQUEST_TIMEOUT_SEC))
             if not rows:
@@ -184,12 +192,15 @@ def main() -> None:
                 key = _ym(d)
                 by_month.setdefault(key, []).append(r)
 
+            pending = deque()
             for ym, month_rows in by_month.items():
                 agg = _aggregate_month(month_rows)
                 if agg is None:
                     continue
                 last_upd = agg["last_updated"] or (now_utc() - timedelta(seconds=1))
-                session.execute(
+                enqueue_async(
+                    session,
+                    pending,
                     ins_monthly,
                     [
                         cid,
@@ -209,8 +220,11 @@ def main() -> None:
                         to_cassandra_ts(last_upd),
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 wrote += 1
+            drain_async(pending)
+            hb.maybe(extra=f"coin={idx}/{len(meta)} flush=done", force=True)
 
         print(f"[{now_str()}] Monthly backfill done. wrote={wrote}")
     finally:

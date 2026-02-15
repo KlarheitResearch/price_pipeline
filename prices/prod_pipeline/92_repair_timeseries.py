@@ -3,27 +3,36 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import pathlib
 import subprocess
+from collections import deque
 from bisect import bisect_left, bisect_right
 from datetime import timedelta
+from types import SimpleNamespace
 
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_10M,
     TABLE_LIVE,
     UTC,
     cg_market_chart_range,
     connect_astra,
+    drain_async,
+    enqueue_async,
     extract_series_in_window,
     floor_10m,
+    is_verbose,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
     to_utc,
+    vprint,
 )
 
 
@@ -31,9 +40,11 @@ REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 SLOT_DELAY_SEC = int(os.getenv("PP_SLOT_DELAY_SEC", "90"))
 REPAIR_10M_HOURS = int(os.getenv("PP_REPAIR_10M_HOURS", "24"))
 REPAIR_INTERPOLATE = os.getenv("PP_REPAIR_INTERPOLATE", "1") == "1"
+REPAIR_REWRITE_NON_API = os.getenv("PP_REPAIR_REWRITE_NON_API", "1") == "1"
 
 REPAIR_LOCK_ENABLED = os.getenv("PP_REPAIR_LOCK_ENABLED", "1") == "1"
-REPAIR_LOCK_JOB = (os.getenv("PP_REPAIR_LOCK_JOB", "pp_repair_10m") or "pp_repair_10m").strip()
+_LOCK_DEFAULT = f"pp_repair_{os.getenv('PP_RANK_START', 'all')}_{os.getenv('PP_RANK_END', 'all')}"
+REPAIR_LOCK_JOB = (os.getenv("PP_REPAIR_LOCK_JOB", _LOCK_DEFAULT) or _LOCK_DEFAULT).strip()
 REPAIR_LOCK_BUCKET_HOURS = int(os.getenv("PP_REPAIR_LOCK_BUCKET_HOURS", "2"))
 REPAIR_LOCK_TTL_SEC = int(os.getenv("PP_REPAIR_LOCK_TTL_SEC", str(2 * 3600 + 300)))
 TABLE_JOB_LOCKS = os.getenv("PP_TABLE_JOB_LOCKS", "pp_job_locks")
@@ -42,6 +53,7 @@ RUN_HOURLY = os.getenv("PP_REPAIR_RUN_HOURLY", "1") == "1"
 RUN_DAILY = os.getenv("PP_REPAIR_RUN_DAILY", "1") == "1"
 RUN_MONTHLY = os.getenv("PP_REPAIR_RUN_MONTHLY", "0") == "1"
 RUN_MCAP = os.getenv("PP_REPAIR_RUN_MCAP", "1") == "1"
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 
 
 class SeriesAccessor:
@@ -99,6 +111,23 @@ class SeriesAccessor:
         if right < len(self.points):
             return self.values[right]
         return None
+
+
+def _source_quality(source: str | None, point_count: int | None) -> int:
+    src = (source or "").strip().lower()
+    try:
+        pts = int(point_count) if point_count is not None else 0
+    except Exception:
+        pts = 0
+    if src == "repair_api_points":
+        return 400 + max(0, pts)
+    if pts > 0:
+        return 300 + pts
+    if src == "repair_api_interp":
+        return 220
+    if src in ("carry_prev", "repair_carry"):
+        return 120
+    return 0
 
 
 def _lock_bucket_utc(bucket_hours: int) -> str:
@@ -166,7 +195,8 @@ def main() -> None:
     print(
         f"[{now_str()}] Repair run start: scope={scope_label()} "
         f"window={window_start.isoformat()}..{window_end.isoformat()} "
-        f"interpolate={REPAIR_INTERPOLATE}"
+        f"interpolate={REPAIR_INTERPOLATE} rewrite_non_api={REPAIR_REWRITE_NON_API} "
+        f"verbose={is_verbose()}"
     )
 
     session, cluster = connect_astra()
@@ -192,7 +222,8 @@ def main() -> None:
         sel_10m_range = session.prepare(
             f"""
             SELECT ts, open, high, low, close, price_usd,
-                   market_cap, volume_24h, last_updated
+                   market_cap, volume_24h, last_updated,
+                   candle_source, point_count
             FROM {TABLE_10M}
             WHERE id=? AND ts>=? AND ts<?
             """
@@ -218,10 +249,21 @@ def main() -> None:
         )
 
         slots = _all_slots(window_start, window_end)
+        hb = Heartbeat("92_repair_timeseries")
         total_missing = 0
+        total_non_api_targets = 0
+        total_skipped_downgrade = 0
         for idx, coin in enumerate(coins, 1):
-            if idx == 1 or idx % 100 == 0 or idx == len(coins):
+            if should_log_progress(idx, len(coins), default_every=100):
                 print(f"[{now_str()}] coin {idx}/{len(coins)} -> {coin.id}")
+            hb.maybe(extra=f"coin={idx}/{len(coins)}")
+            coin_started = time.monotonic()
+            coin_skipped_dg_start = total_skipped_downgrade
+            if is_verbose():
+                vprint(
+                    f"[repair] {coin.id}: loading existing 10m rows for "
+                    f"{window_start.isoformat()}..{window_end.isoformat()}"
+                )
 
             rows = list(
                 session.execute(
@@ -232,10 +274,30 @@ def main() -> None:
             )
             existing = {to_utc(r.ts): r for r in rows if getattr(r, "ts", None) is not None}
             missing_slots = [s for s in slots if s not in existing]
-            if not missing_slots:
+            non_api_slots: list = []
+            if REPAIR_REWRITE_NON_API:
+                for s in slots:
+                    row = existing.get(s)
+                    if row is None:
+                        continue
+                    src = (getattr(row, "candle_source", None) or "").strip().lower()
+                    pts = getattr(row, "point_count", None)
+                    if src != "repair_api_points" or not isinstance(pts, int) or pts <= 0:
+                        non_api_slots.append(s)
+
+            target_slots = sorted(set(missing_slots + non_api_slots))
+            if is_verbose():
+                vprint(
+                    f"[repair] {coin.id}: existing={len(existing)} missing={len(missing_slots)} "
+                    f"non_api_targets={len(non_api_slots)} total_targets={len(target_slots)}"
+                )
+            if not target_slots:
+                if is_verbose():
+                    vprint(f"[repair] {coin.id}: no targets, skip API.")
                 continue
 
             total_missing += len(missing_slots)
+            total_non_api_targets += len(non_api_slots)
 
             prev = session.execute(
                 sel_prev_10m,
@@ -246,6 +308,11 @@ def main() -> None:
             last_mcap = float(prev.market_cap) if prev and getattr(prev, "market_cap", None) is not None else None
             last_vol = float(prev.volume_24h) if prev and getattr(prev, "volume_24h", None) is not None else None
 
+            if is_verbose():
+                vprint(
+                    f"[repair] {coin.id}: requesting market_chart range "
+                    f"{(window_start - timedelta(hours=1)).isoformat()}..{window_end.isoformat()}"
+                )
             try:
                 data = cg_market_chart_range(
                     coin.id,
@@ -279,10 +346,43 @@ def main() -> None:
                 )
             )
 
-            missing_slots.sort()
+            if is_verbose():
+                vprint(
+                    f"[repair] {coin.id}: api points prices={len(price_series.points)} "
+                    f"mcap={len(mcap_series.points)} vol={len(vol_series.points)}"
+                )
+
             coin_inserted = 0
-            for slot_start in missing_slots:
+            target_set = set(target_slots)
+            pending = deque()
+            for sidx, slot_start in enumerate(slots, 1):
                 slot_end = slot_start + timedelta(minutes=10)
+                existing_row = existing.get(slot_start)
+                if sidx % 72 == 0:
+                    hb.maybe(
+                        extra=(
+                            f"coin={idx}/{len(coins)} slot={sidx}/{len(slots)} "
+                            f"inserted={coin_inserted}"
+                        )
+                    )
+                    if is_verbose():
+                        vprint(
+                            f"[repair] {coin.id}: slot {sidx}/{len(slots)} "
+                            f"inserted={coin_inserted}"
+                        )
+                if slot_start not in target_set:
+                    if existing_row is not None:
+                        ex_close = getattr(existing_row, "close", None)
+                        ex_mcap = getattr(existing_row, "market_cap", None)
+                        ex_vol = getattr(existing_row, "volume_24h", None)
+                        if ex_close is not None:
+                            last_close = float(ex_close)
+                        if ex_mcap is not None:
+                            last_mcap = float(ex_mcap)
+                        if ex_vol is not None:
+                            last_vol = float(ex_vol)
+                    continue
+
                 point_vals = price_series.values_in_slot(slot_start, slot_end)
                 last_point = price_series.last_point_in_slot(slot_start, slot_end)
 
@@ -323,7 +423,28 @@ def main() -> None:
                 if vol is None:
                     vol = last_vol
 
-                session.execute(
+                if existing_row is not None:
+                    old_q = _source_quality(
+                        getattr(existing_row, "candle_source", None),
+                        getattr(existing_row, "point_count", None),
+                    )
+                    new_q = _source_quality(source, point_count)
+                    if new_q < old_q:
+                        total_skipped_downgrade += 1
+                        ex_close = getattr(existing_row, "close", None)
+                        ex_mcap = getattr(existing_row, "market_cap", None)
+                        ex_vol = getattr(existing_row, "volume_24h", None)
+                        if ex_close is not None:
+                            last_close = float(ex_close)
+                        if ex_mcap is not None:
+                            last_mcap = float(ex_mcap)
+                        if ex_vol is not None:
+                            last_vol = float(ex_vol)
+                        continue
+
+                enqueue_async(
+                    session,
+                    pending,
                     ins_10m,
                     [
                         coin.id,
@@ -345,6 +466,7 @@ def main() -> None:
                         int(point_count),
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 coin_inserted += 1
                 total_inserted += 1
@@ -353,16 +475,29 @@ def main() -> None:
                     last_mcap = float(mcap)
                 if vol is not None:
                     last_vol = float(vol)
-
-            if coin_inserted:
-                print(
-                    f"[{now_str()}] repaired {coin_inserted}/{len(missing_slots)} "
-                    f"slots for {coin.id}"
+                existing[slot_start] = SimpleNamespace(
+                    close=float(close),
+                    market_cap=float(mcap) if mcap is not None else None,
+                    volume_24h=float(vol) if vol is not None else None,
+                    candle_source=source,
+                    point_count=int(point_count),
                 )
+
+            drain_async(pending)
+            hb.maybe(extra=f"coin={idx}/{len(coins)} flush=done", force=True)
+            coin_elapsed = int(time.monotonic() - coin_started)
+            coin_skipped_dg = total_skipped_downgrade - coin_skipped_dg_start
+            print(
+                f"[{now_str()}] coin_done {idx}/{len(coins)} {coin.id} "
+                f"targets={len(target_slots)} inserted={coin_inserted} "
+                f"missing={len(missing_slots)} non_api={len(non_api_slots)} "
+                f"skipped_downgrade={coin_skipped_dg} elapsed={coin_elapsed}s"
+            )
 
         print(
             f"[{now_str()}] Repair done. missing_slots={total_missing} "
-            f"inserted={total_inserted}"
+            f"non_api_targets={total_non_api_targets} inserted={total_inserted} "
+            f"skipped_downgrade={total_skipped_downgrade}"
         )
     finally:
         try:

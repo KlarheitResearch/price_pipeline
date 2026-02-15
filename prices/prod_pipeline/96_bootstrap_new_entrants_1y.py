@@ -5,19 +5,24 @@ import os
 import pathlib
 import subprocess
 import sys
+from collections import deque
 from datetime import date, datetime, timedelta
 
 from cassandra.query import SimpleStatement
 
 from common import (
+    Heartbeat,
     TABLE_DAILY,
     TABLE_LIVE,
     UTC,
     cg_market_chart_range,
     connect_astra,
+    drain_async,
+    enqueue_async,
     extract_series_in_window,
     now_str,
     now_utc,
+    should_log_progress,
     scope_label,
     select_coins_from_live_rows,
     to_cassandra_ts,
@@ -25,6 +30,7 @@ from common import (
 
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 BOOTSTRAP_DAYS = int(os.getenv("PP_BOOTSTRAP_DAYS", "365"))
 BOOTSTRAP_MAX_COINS = int(os.getenv("PP_BOOTSTRAP_MAX_COINS", "20"))
 BOOTSTRAP_OVERWRITE = os.getenv("PP_BOOTSTRAP_OVERWRITE", "0") == "1"
@@ -156,9 +162,11 @@ def main() -> None:
         to_process = candidates[:BOOTSTRAP_MAX_COINS]
 
         print(f"[{now_str()}] Candidates={len(candidates)} processing={len(to_process)}")
+        hb = Heartbeat("96_bootstrap_new_entrants_1y")
         for idx, coin in enumerate(to_process, 1):
-            if idx == 1 or idx % LOG_EVERY == 0 or idx == len(to_process):
+            if should_log_progress(idx, len(to_process), default_every=LOG_EVERY):
                 print(f"[{now_str()}] coin {idx}/{len(to_process)} -> {coin.id}")
+            hb.maybe(extra=f"coin={idx}/{len(to_process)}")
 
             existing_rows = list(
                 session.execute(
@@ -198,6 +206,7 @@ def main() -> None:
             by_day_vol = _build_last_value_map(volumes, start_day, end_day)
 
             coin_inserted = 0
+            pending = deque()
             day_key = start_day
             while day_key <= end_day:
                 if not BOOTSTRAP_OVERWRITE and day_key in existing_days:
@@ -221,7 +230,9 @@ def main() -> None:
                 mcap = float(mcap_pair[0]) if mcap_pair is not None else None
                 vol = float(vol_pair[0]) if vol_pair is not None else None
 
-                session.execute(
+                enqueue_async(
+                    session,
+                    pending,
                     ins_daily,
                     [
                         coin.id,
@@ -243,10 +254,13 @@ def main() -> None:
                         to_cassandra_ts(last_price_ts),
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,
+                    max_in_flight=ASTRA_MAX_IN_FLIGHT,
                 )
                 coin_inserted += 1
                 total_inserted += 1
                 day_key += timedelta(days=1)
+            drain_async(pending)
+            hb.maybe(extra=f"coin={idx}/{len(to_process)} flush=done", force=True)
 
             if coin_inserted > 0:
                 bootstrapped_coins += 1

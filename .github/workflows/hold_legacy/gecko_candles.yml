@@ -1,43 +1,43 @@
-name: gecko-prices-realtime
+name: gecko-prices-candles
 
 on:
   workflow_dispatch:
     inputs:
-      run_01:
-        description: "AA_gck_load_prices_live.py (5-in-1)"
+      run_03:
+        description: "DD_gck_create_hourly_from_10m.py"
         required: false
         default: "true"
-      run_02:
-        description: "CC_gck_append_10m_from_live.py"
+      run_04:
+        description: "EE_gck_create_daily_from_10m.py"
         required: false
         default: "true"
-      run_gapfill:
-        description: "CC_gck_append_10m_from_live.py (gapfill last N hours; slower; manual only)"
+      run_05:
+        description: "EG_gck_update_monthly_from_daily.py"
         required: false
-        default: "false"
+        default: "true"
       TOP_N:
         description: "Override TOP_N"
-        required: false
-        default: ""
-      RANK_TOP_N:
-        description: "Override RANK_TOP_N"
         required: false
         default: ""
       VERBOSE_MODE:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+      CURRENT_ONLY:
+        description: "Hourly: only prev_final + curr_partial (0/1)"
+        required: false
+        default: "0"
 
-  # Backup only (GitHub schedule is best-effort): every 20 minutes, offset away from :00
+  # Backup only: every hour, offset away from :00
   schedule:
-    - cron: "2-59/20 * * * *"
+    - cron: "26 * * * *"
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: gecko-prices-realtime-${{ github.ref }}
+  group: gecko-prices-candles-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -80,8 +80,6 @@ jobs:
             }
 
             // If a successful workflow_dispatch ran recently, skip the schedule backup.
-            // Note: GitHub's listWorkflowRunsForRepo response doesn't expose dispatch inputs,
-            // so this treats ANY successful workflow_dispatch (Cloudflare or manual) as "recent".
             const recentSuccessfulDispatch = runs.find(r =>
               r.event === 'workflow_dispatch' &&
               r.status === 'completed' &&
@@ -97,7 +95,7 @@ jobs:
     needs: [recent_check]
     if: needs.recent_check.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -105,14 +103,15 @@ jobs:
       PYTHONWARNINGS: default
 
       # Normalize so schedule behaves like dispatch
-      RUN_01: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_01 || 'true') }}
-      RUN_02: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_02 || 'true') }}
-      # Gapfill is manual-only (never on schedule)
-      RUN_GAPFILL: ${{ (github.event_name == 'schedule' && 'false') || (github.event.inputs.run_gapfill || 'false') }}
+      RUN_03: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_03 || 'true') }}
+      RUN_04: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_04 || 'true') }}
+      RUN_05: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_05 || 'true') }}
 
       TOP_N_RESOLVED: ${{ (github.event.inputs.TOP_N != '' && github.event.inputs.TOP_N) || secrets.TOP_N || '300' }}
-      RANK_TOP_N_RESOLVED: ${{ (github.event.inputs.RANK_TOP_N != '' && github.event.inputs.RANK_TOP_N) || secrets.RANK_TOP_N || secrets.TOP_N || '300' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+
+      # For backup schedule runs, use CURRENT_ONLY=1 (lightweight), otherwise respect dispatch input.
+      CURRENT_ONLY_RESOLVED: ${{ (github.event_name == 'schedule' && '1') || (github.event.inputs.CURRENT_ONLY || '0') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +124,7 @@ jobs:
 
       - name: Install deps
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -136,79 +136,67 @@ jobs:
           echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
           test -s secure-connect.zip
 
-      - name: 01 Load ALL live tables (5-in-1)
-        if: env.RUN_01 == 'true'
-        timeout-minutes: 10
-        env:
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
-          TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          RANK_TOP_N: "${{ env.RANK_TOP_N_RESOLVED }}"
-
-          STALE_WARN_MINUTES: "10"
-          REQUIRED_LIVE_MIN: "140"
-
-          RETRIES: "3"
-          BACKOFF_MIN: "5"
-          MAX_BACKOFF_MIN: "30"
-          REQUEST_TIMEOUT_SEC: "60"
-          CONNECT_TIMEOUT_SEC: "15"
-          BATCH_FLUSH_EVERY: "40"
-
-          RANK_BUCKET: "all"
-          GECKO_MCAP_BUCKET: "categories"
-
-          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/AA_gck_load_prices_live.py
-
-      - name: 02 Append 10m from live_rolling
-        if: env.RUN_02 == 'true'
-        timeout-minutes: 7
-        env:
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
-          TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "60"
-          CONNECT_TIMEOUT_SEC: "15"
-          FETCH_SIZE: "500"
-          SLOT_DELAY_SEC: "120"
-          SLOTS_BACKFILL: "4"
-          AGG_MIN_COINS: "200"
-          AGG_CARRY_FORWARD: "1"
-          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/CC_gck_append_10m_from_live.py
-
-      - name: 02b Gapfill missing 10m slots (last 12h)
-        if: env.RUN_GAPFILL == 'true' && env.RUN_02 == 'true'
+      - name: 03 Update hourly from 10m
+        if: env.RUN_03 == 'true'
         timeout-minutes: 12
         env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
 
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "60"
+          REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-
-          # GAPFILL MODE
-          GAPFILL_ENABLED: "1"
-          GAPFILL_HOURS: "12"
-          GAPFILL_LOCK_ENABLED: "1"
-          GAPFILL_LOCK_JOB: "append_10m_gapfill"
-          GAPFILL_WRITE_AGG: "1"
-          REBUILD_AGG_AFTER_GAPFILL: "1"
+          CURRENT_ONLY: "${{ env.CURRENT_ONLY_RESOLVED }}"
+          FINALIZE_PREV: "1"
+          PROGRESS_EVERY: "20"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
           AGG_MIN_COINS: "200"
           AGG_CARRY_FORWARD: "1"
+        run: python prices/legacy_backup/DD_gck_create_hourly_from_10m.py
 
+      - name: 04 Update/close daily from 10m
+        if: env.RUN_04 == 'true'
+        timeout-minutes: 12
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          SLOT_DELAY_SEC: "120"
+          PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/CC_gck_append_10m_from_live.py
+          WRITE_MCAP_DAILY: "1"
+          AGG_MIN_COINS: "200"
+          AGG_CARRY_FORWARD: "1"
+        run: python prices/legacy_backup/EE_gck_create_daily_from_10m.py
+
+      - name: 05 Update monthly from daily/live
+        if: env.RUN_05 == 'true'
+        timeout-minutes: 8
+        env:
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER }}
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          PROGRESS_EVERY: "20"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
+        run: python prices/legacy_backup/EG_gck_update_monthly_from_daily.py
+
+

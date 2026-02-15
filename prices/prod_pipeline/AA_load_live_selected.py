@@ -2,22 +2,32 @@
 from __future__ import annotations
 
 import math
+import os
+from collections import deque
 from datetime import datetime
 
 from common import (
+    Heartbeat,
     TABLE_LIVE,
     TABLE_ROLLING,
     category_for,
     cg_get,
     connect_astra,
+    drain_async,
+    enqueue_async,
     get_test_coin_ids,
     get_rank_window,
+    is_verbose,
     now_str,
     now_utc,
     parse_cg_iso,
+    should_log_progress,
     scope_label,
     to_cassandra_ts,
 )
+
+REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
+ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 
 
 def _f(x):
@@ -28,6 +38,7 @@ def _f(x):
 
 
 def main() -> None:
+    hb = Heartbeat("AA_load_live_selected")
     rank_window = get_rank_window()
     rows = []
     by_id = {}
@@ -121,9 +132,13 @@ def main() -> None:
     )
 
     wrote = 0
+    pending = deque()
     try:
         scoped_ids = sorted(by_id.keys())
-        for cid in scoped_ids:
+        for idx, cid in enumerate(scoped_ids, 1):
+            if should_log_progress(idx, len(scoped_ids), default_every=50):
+                print(f"[{now_str()}] coin {idx}/{len(scoped_ids)} -> {cid}")
+            hb.maybe(extra=f"coin={idx}/{len(scoped_ids)}")
             row = by_id[cid]
 
             lu = parse_cg_iso(row.get("last_updated")) or now_ts
@@ -175,10 +190,27 @@ def main() -> None:
                 "usd",
             ]
 
-            session.execute(ins_live, vals_live)
-            session.execute(ins_rolling, vals_rolling)
+            enqueue_async(
+                session,
+                pending,
+                ins_live,
+                vals_live,
+                timeout=REQUEST_TIMEOUT_SEC,
+                max_in_flight=ASTRA_MAX_IN_FLIGHT,
+            )
+            enqueue_async(
+                session,
+                pending,
+                ins_rolling,
+                vals_rolling,
+                timeout=REQUEST_TIMEOUT_SEC,
+                max_in_flight=ASTRA_MAX_IN_FLIGHT,
+            )
             wrote += 1
-            print(f"[{now_str()}] upserted live+rolling: {cid} ({sym})")
+            if is_verbose():
+                print(f"[{now_str()}] upserted live+rolling: {cid} ({sym})")
+        drain_async(pending)
+        hb.maybe(extra="flush=done", force=True)
     finally:
         try:
             cluster.shutdown()
