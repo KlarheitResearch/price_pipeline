@@ -30,6 +30,52 @@ Active workflow set is intentionally small:
 - `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
 
+All workflow script steps run through:
+
+- `prices/legacy_backup/pipeline_health_runner.py`
+
+So each run writes `running/success/failed` to:
+
+- `pp_pipeline_runs`
+- `pp_pipeline_latest`
+
+Legacy script IDs written to health tables:
+
+- `AA_gck_load_prices_live`
+- `CC_gck_append_10m_from_live`
+- `DD_gck_create_hourly_from_10m`
+- `EE_gck_create_daily_from_10m`
+- `EG_gck_update_monthly_from_daily`
+- `EF_gck_close_daily_topn_api`
+- `FF_gck_coin_data_availability`
+- `audit_10m_gaps`
+- `GM_gck_manual_repair_intraday`
+
+### Coverage and availability tables
+
+Data availability monitoring remains based on:
+
+- `coin_daily_coverage_ranges`
+- `coin_daily_availability`
+- `coin_intraday_coverage`
+
+Population path:
+
+- `FF_gck_coin_data_availability.py` refreshes all three tables (daily + intraday windows).
+- `GG_gck_dq_repair_timeseries.py` consumes these tables for targeted repair guidance.
+
+Recommended schedule:
+
+- Run `gecko_legacy_maintenance.yml` daily after the API daily close workflow.
+- Keep maintenance independent from 10m runtime cadence to avoid contention.
+
+CC runtime tuning knobs (for timeout control):
+
+- `COIN_WORKERS` (default `8`) for bounded per-coin planning concurrency.
+- `WRITE_CONCURRENCY` (default `16`) for bounded async insert pipeline depth.
+- `APPEND_SKIP_EXISTING=1` to skip already-filled slots early.
+- `PROGRESS_EVERY` to keep logs light in non-verbose mode.
+
 Original prod-era workflow files are archived (not active) at:
 
 - `backend/prices/prod_pipeline/workflows_archive/original_github/`

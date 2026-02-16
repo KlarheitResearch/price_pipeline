@@ -18,6 +18,8 @@
 import os, traceback
 from datetime import datetime, timedelta, timezone
 from typing import Tuple, List, Dict, Any, cast, overload
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 
 # ───────────────────────── Astra connector ─────────────────────────
 from astra_connect.connect import get_session, AstraConfig
@@ -53,6 +55,14 @@ AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", str(_DEFAULT_AGG_MIN)))
 if AGG_MIN_COINS < 0:
     AGG_MIN_COINS = 0
 AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
+VERBOSE_MODE = os.getenv("VERBOSE_MODE", "0") == "1"
+PROGRESS_EVERY = max(1, int(os.getenv("PROGRESS_EVERY", "100")))
+APPEND_SKIP_EXISTING = os.getenv("APPEND_SKIP_EXISTING", "1") == "1"
+APPEND_AGG_FROM_EXISTING = os.getenv("APPEND_AGG_FROM_EXISTING", "0") == "1"
+LOG_SLOT_LINES = VERBOSE_MODE and (os.getenv("LOG_SLOT_LINES", "0") == "1")
+LOG_INSERT_LINES = VERBOSE_MODE and (os.getenv("LOG_INSERT_LINES", "0") == "1")
+COIN_WORKERS = max(1, int(os.getenv("COIN_WORKERS", "8")))
+WRITE_CONCURRENCY = max(1, int(os.getenv("WRITE_CONCURRENCY", "16")))
 
 # Optional post-run aggregate rebuild (recompute from stored 10m rows).
 REBUILD_AGG_AFTER_GAPFILL = os.getenv("REBUILD_AGG_AFTER_GAPFILL", "0") == "1"
@@ -66,6 +76,12 @@ TABLE_MCAP_OUT     = os.getenv("TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def should_log_coin(index: int, total: int) -> bool:
+    if VERBOSE_MODE:
+        return True
+    return index == 1 or index == total or (index % PROGRESS_EVERY == 0)
 
 @overload
 def to_utc(x: None) -> None:
@@ -141,13 +157,13 @@ SEL_COINS = SimpleStatement(
     fetch_size=FETCH_SIZE
 )
 
-# Latest point within the slot (rolling is clustered on last_updated)
-SEL_IN_SLOT_PS = session.prepare(
+# Rolling points in the target window (used to avoid per-slot reads).
+SEL_ROLLING_RANGE_PS = session.prepare(
     f"""
     SELECT last_updated, price_usd, market_cap, volume_24h,
            market_cap_rank, circulating_supply, total_supply
     FROM {TABLE_ROLLING}
-    WHERE id=? AND last_updated>=? AND last_updated<? LIMIT 1
+    WHERE id=? AND last_updated>=? AND last_updated<?
     """
 )
 
@@ -385,6 +401,154 @@ def read_prev_mcap(category: str, slot_start: datetime):
         "market_cap_rank": getattr(row, "market_cap_rank", None),
     }
 
+
+def _point_from_row(row: Any) -> Dict[str, Any] | None:
+    if row is None:
+        return None
+    if getattr(row, "price_usd", None) is None:
+        return None
+    lu = to_utc(getattr(row, "last_updated", None))
+    if lu is None:
+        return None
+    return {
+        "last_updated": lu,
+        "price": float(getattr(row, "price_usd")),
+        "mcap": float(getattr(row, "market_cap")) if getattr(row, "market_cap", None) is not None else 0.0,
+        "vol": float(getattr(row, "volume_24h")) if getattr(row, "volume_24h", None) is not None else 0.0,
+        "rank": int(getattr(row, "market_cap_rank")) if getattr(row, "market_cap_rank", None) is not None else None,
+        "circ": float(getattr(row, "circulating_supply")) if getattr(row, "circulating_supply", None) is not None else None,
+        "totl": float(getattr(row, "total_supply")) if getattr(row, "total_supply", None) is not None else None,
+    }
+
+
+def plan_coin_slots(
+    coin: Any,
+    index: int,
+    total: int,
+    slots: List[Tuple[datetime, datetime]],
+    slot_start_set: set[datetime],
+    run_mode: str,
+) -> Dict[str, Any]:
+    coin_id = getattr(coin, "id", None)
+    sym = getattr(coin, "symbol", None)
+    name = getattr(coin, "name", None)
+    rank = getattr(coin, "market_cap_rank", None)
+    coin_category = (getattr(coin, "category", None) or "Other").strip() or "Other"
+
+    out: Dict[str, Any] = {
+        "index": index,
+        "total": total,
+        "coin_id": coin_id,
+        "symbol": sym,
+        "name": name,
+        "rank": rank,
+        "category": coin_category,
+        "entries": [],
+        "plan_error": None,
+    }
+
+    if not coin_id:
+        out["plan_error"] = "missing coin id"
+        return out
+    if not slots:
+        return out
+
+    w_start = slots[0][0]
+    w_end = slots[-1][1]
+
+    existing_ts: set[datetime] = set()
+    should_prefetch_existing = run_mode == "gapfill" or (run_mode == "append" and APPEND_SKIP_EXISTING)
+    if should_prefetch_existing:
+        try:
+            rs = session.execute(
+                SEL_10M_EXISTING_TS_RANGE_PS,
+                [coin_id, w_start, w_end],
+                timeout=REQUEST_TIMEOUT,
+            )
+            for r in rs:
+                ts0 = getattr(r, "ts", None)
+                if isinstance(ts0, datetime):
+                    ts_utc = to_utc(ts0)
+                    if ts_utc is not None:
+                        existing_ts.add(ts_utc)
+        except Exception as e:
+            out["plan_error"] = f"existing-range read failed: {e}"
+            return out
+
+    slot_points: Dict[datetime, Dict[str, Any]] = {}
+    try:
+        rs = session.execute(
+            SEL_ROLLING_RANGE_PS,
+            [coin_id, w_start, w_end],
+            timeout=REQUEST_TIMEOUT,
+        )
+        for row in rs:
+            point = _point_from_row(row)
+            if point is None:
+                continue
+            slot_start = floor_slot(point["last_updated"])
+            if slot_start not in slot_start_set:
+                continue
+            prev = slot_points.get(slot_start)
+            if prev is None or point["last_updated"] > prev["last_updated"]:
+                slot_points[slot_start] = point
+    except Exception as e:
+        out["plan_error"] = f"rolling-range read failed: {e}"
+        return out
+
+    try:
+        prev_row = session.execute(
+            SEL_PREV_PS,
+            [coin_id, w_start],
+            timeout=REQUEST_TIMEOUT,
+        ).one()
+        last_real_point = _point_from_row(prev_row)
+    except Exception as e:
+        out["plan_error"] = f"prev read failed: {e}"
+        return out
+
+    carry_used = 0
+    entries: List[Dict[str, Any]] = []
+    for start, end in slots:
+        if start in existing_ts:
+            entries.append({"kind": "existing", "start": start, "end": end})
+            continue
+
+        point = slot_points.get(start)
+        if point is not None:
+            source = "hist-in-slot"
+            carry_used = 0
+            last_real_point = point
+        else:
+            if last_real_point is None:
+                entries.append({"kind": "skip", "start": start, "end": end, "reason": "no-history"})
+                continue
+            if carry_used >= ALLOW_CARRY_MAX_SLOTS:
+                entries.append({"kind": "skip", "start": start, "end": end, "reason": "carry-cap"})
+                continue
+            source = "hist-carry"
+            point = last_real_point
+            carry_used += 1
+
+        entries.append(
+            {
+                "kind": "insert",
+                "start": start,
+                "end": end,
+                "source": source,
+                "slot_last_upd": end - timedelta(seconds=1),
+                "price": point["price"],
+                "mcap": point["mcap"],
+                "vol": point["vol"],
+                "rank": point["rank"],
+                "circ": point["circ"],
+                "totl": point["totl"],
+            }
+        )
+
+    out["entries"] = entries
+    return out
+
 # ───────────────────────── Main logic ─────────────────────────
 def main():
     # Decide run mode early (append is always allowed; gapfill is optional)
@@ -445,138 +609,232 @@ def main():
             entry["last_updated"] = last_upd
 
     wrote = skipped = 0
+    slot_start_set = {s for (s, _e) in slots}
+    plan_rows: List[Dict[str, Any]] = []
 
-    for ci, c in enumerate(coins, 1):
-        sym = getattr(c, "symbol", None)
-        name = getattr(c, "name", None)
-        mkr = getattr(c, "market_cap_rank", None)
-        coin_id = getattr(c, "id")
-        print(f"[{now_str()}] → [{ci}/{len(coins)}] {sym} ({coin_id}) rank={mkr}")
-        coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
-        categories_seen.add(coin_category)
-        carry_used = 0
-        # In gapfill mode, discover which 10m slots already exist for this coin in the window.
-        existing_ts: set = set()
-        if run_mode == "gapfill" and slots:
-            w_start = slots[0][0]
-            w_end   = slots[-1][1]
-            try:
-                rs = session.execute(
-                    SEL_10M_EXISTING_TS_RANGE_PS,
-                    [coin_id, w_start, w_end],
-                    timeout=REQUEST_TIMEOUT
-                )
-                for r in rs:
-                    ts0 = getattr(r, "ts", None)
-                    if isinstance(ts0, datetime):
-                        existing_ts.add(to_utc(ts0))
-                print(f"[{now_str()}]    [gapfill] existing_10m_in_window={len(existing_ts)} "
-                      f"window={w_start}..{w_end}")
-            except Exception as e:
-                print(f"[{now_str()}]    [gapfill][WARN] failed to read existing 10m range: {e}")
-                existing_ts = set()
+    if coins and slots:
+        worker_count = min(COIN_WORKERS, len(coins))
+        if worker_count > 1:
+            print(f"[{now_str()}] Planning slot candidates with workers={worker_count}")
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(
+                        plan_coin_slots,
+                        c,
+                        ci,
+                        len(coins),
+                        slots,
+                        slot_start_set,
+                        run_mode,
+                    ): (ci, c)
+                    for ci, c in enumerate(coins, 1)
+                }
+                for fut in as_completed(future_map):
+                    ci, c = future_map[fut]
+                    try:
+                        plan_rows.append(fut.result())
+                    except Exception as e:
+                        plan_rows.append(
+                            {
+                                "index": ci,
+                                "total": len(coins),
+                                "coin_id": getattr(c, "id", None),
+                                "symbol": getattr(c, "symbol", None),
+                                "name": getattr(c, "name", None),
+                                "rank": getattr(c, "market_cap_rank", None),
+                                "category": (getattr(c, "category", None) or "Other").strip() or "Other",
+                                "entries": [],
+                                "plan_error": f"planning failed: {e}",
+                            }
+                        )
+        else:
+            for ci, c in enumerate(coins, 1):
+                plan_rows.append(plan_coin_slots(c, ci, len(coins), slots, slot_start_set, run_mode))
 
-        for si, (start, end) in enumerate(slots, 1):
-            # print each slot with minimal noise
-            print(f"    slot {si}/{len(slots)} {start} → {end}")
+        plan_rows.sort(key=lambda item: int(item.get("index") or 0))
 
-            # gapfill mode: skip if this slot already exists
-            if run_mode == "gapfill":
-                if start in existing_ts:
-                    if GAPFILL_WRITE_AGG:
-                        existing_vals = read_existing_slot(coin_id, start, end)
-                        if existing_vals:
-                            mcap_exist, vol_exist, lu_exist = existing_vals
-                            bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
-                            bump_slot_total(start, 'ALL', mcap_exist, vol_exist, lu_exist)
-                            bump_slot_coin_count(start)
-                        else:
-                            print("        exists -> skip (no row for agg)")
-                    else:
-                        print("        exists -> skip")
-                    skipped += 1
-                    continue
+    coin_stats: Dict[int, Dict[str, int]] = {}
+    pending_writes = deque()
 
-            # try to read a row *inside* the slot window
-            try:
-                in_slot = session.execute(SEL_IN_SLOT_PS, [coin_id, start, end], timeout=REQUEST_TIMEOUT).one()
-            except Exception as e:
-                print(f"        [READ-ERR] in-slot {sym} {start}→{end}: {e} (skip)"); skipped += 1; continue
+    def add_coin_stat(ci: int, *, wrote_delta: int = 0, skipped_delta: int = 0) -> None:
+        nonlocal wrote, skipped
+        stats = coin_stats.setdefault(ci, {"wrote": 0, "skipped": 0})
+        if wrote_delta:
+            stats["wrote"] += wrote_delta
+            wrote += wrote_delta
+        if skipped_delta:
+            stats["skipped"] += skipped_delta
+            skipped += skipped_delta
 
-            if in_slot and in_slot.price_usd is not None:
-                price = float(in_slot.price_usd)
-                mcap  = float(in_slot.market_cap) if in_slot.market_cap is not None else 0.0
-                vol   = float(in_slot.volume_24h) if in_slot.volume_24h is not None else 0.0
-                rank  = int(in_slot.market_cap_rank) if in_slot.market_cap_rank is not None else None
-                circ  = float(in_slot.circulating_supply) if in_slot.circulating_supply is not None else None
-                totl  = float(in_slot.total_supply) if in_slot.total_supply is not None else None
-                source = "hist-in-slot"
-                # reset carry streak when we have a true in-slot point
-                carry_used = 0
-            else:
-                if carry_used >= ALLOW_CARRY_MAX_SLOTS:
-                    print("        carry cap reached → skip"); skipped += 1; continue
-                # otherwise carry: grab latest point *before* slot start
-                try:
-                    prev = session.execute(SEL_PREV_PS, [coin_id, start], timeout=REQUEST_TIMEOUT).one()
-                except Exception as e:
-                    print(f"        [READ-ERR] prev {sym} < {start}: {e} (skip)"); skipped += 1; continue
+    def apply_existing_agg(coin_id: str, coin_category: str, start: datetime, end: datetime) -> None:
+        if run_mode == "gapfill" and GAPFILL_WRITE_AGG:
+            existing_vals = read_existing_slot(coin_id, start, end)
+            if existing_vals:
+                mcap_exist, vol_exist, lu_exist = existing_vals
+                bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                bump_slot_total(start, "ALL", mcap_exist, vol_exist, lu_exist)
+                bump_slot_coin_count(start)
+        elif run_mode == "append" and APPEND_AGG_FROM_EXISTING:
+            existing_vals = read_existing_slot(coin_id, start, end)
+            if existing_vals:
+                mcap_exist, vol_exist, lu_exist = existing_vals
+                bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                bump_slot_total(start, "ALL", mcap_exist, vol_exist, lu_exist)
+                bump_slot_coin_count(start)
 
-                if prev and prev.price_usd is not None:
-                    price = float(prev.price_usd)
-                    mcap  = float(prev.market_cap) if prev.market_cap is not None else 0.0
-                    vol   = float(prev.volume_24h) if prev.volume_24h is not None else 0.0
-                    rank  = int(prev.market_cap_rank) if prev.market_cap_rank is not None else None
-                    circ  = float(prev.circulating_supply) if prev.circulating_supply is not None else None
-                    totl  = float(prev.total_supply) if prev.total_supply is not None else None
-                    source = "hist-carry"
-                    carry_used += 1
+    def handle_write_result(ctx: Dict[str, Any], result_obj: Any) -> None:
+        ci = int(ctx["ci"])
+        start = cast(datetime, ctx["start"])
+        end = cast(datetime, ctx["end"])
+        coin_id = cast(str, ctx["coin_id"])
+        coin_category = cast(str, ctx["coin_category"])
+        mcap = float(ctx["mcap"])
+        vol = float(ctx["vol"])
+        slot_last_upd = cast(datetime, ctx["slot_last_upd"])
+        source = cast(str, ctx["source"])
+
+        applied = bool(getattr(result_obj, "applied", True)) if result_obj is not None else True
+
+        # Aggregate in append mode for newly written rows only by default.
+        if (run_mode != "gapfill") or GAPFILL_WRITE_AGG:
+            if applied:
+                bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                bump_slot_total(start, "ALL", mcap, vol, slot_last_upd)
+                bump_slot_coin_count(start)
+            elif run_mode == "append" and APPEND_AGG_FROM_EXISTING:
+                existing_vals = read_existing_slot(coin_id, start, end)
+                if existing_vals:
+                    mcap_exist, vol_exist, lu_exist = existing_vals
+                    bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                    bump_slot_total(start, "ALL", mcap_exist, vol_exist, lu_exist)
+                    bump_slot_coin_count(start)
+            elif run_mode == "gapfill" and GAPFILL_WRITE_AGG:
+                existing_vals = read_existing_slot(coin_id, start, end)
+                if existing_vals:
+                    mcap_exist, vol_exist, lu_exist = existing_vals
+                    bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
+                    bump_slot_total(start, "ALL", mcap_exist, vol_exist, lu_exist)
+                    bump_slot_coin_count(start)
                 else:
-                    print("        no history for slot (and no previous) → skip")
-                    skipped += 1
-                    continue
+                    bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
+                    bump_slot_total(start, "ALL", mcap, vol, slot_last_upd)
+                    bump_slot_coin_count(start)
 
-            # clamp last_updated to slot end (represents slot's EoS)
-            slot_last_upd = end - timedelta(seconds=1)
+        if LOG_INSERT_LINES and should_log_coin(ci, len(coins)):
+            print(
+                f"        insert {'applied' if applied else 'skipped'} "
+                f"({source}, price={ctx['price']}, mcap={mcap}, vol={vol}, rank={ctx['rank']}, "
+                f"circ={ctx['circ']}, totl={ctx['totl']}, last_upd={slot_last_upd})"
+            )
+
+        if applied:
+            add_coin_stat(ci, wrote_delta=1)
+        else:
+            add_coin_stat(ci, skipped_delta=1)
+
+    def drain_one_write() -> None:
+        if not pending_writes:
+            return
+        fut, ctx = pending_writes.popleft()
+        ci = int(ctx["ci"])
+        try:
+            result_obj = fut.result()
+            handle_write_result(ctx, result_obj)
+        except Exception as e:
+            print(f"        [WRITE-ERR] insert {ctx['symbol']} {ctx['start']}: {e} (skip)")
+            traceback.print_exc()
+            add_coin_stat(ci, skipped_delta=1)
+
+    for plan in plan_rows:
+        ci = int(plan.get("index") or 0)
+        sym = plan.get("symbol")
+        name = plan.get("name")
+        mkr = plan.get("rank")
+        coin_id_raw = plan.get("coin_id")
+        coin_id = str(coin_id_raw) if coin_id_raw is not None else ""
+        coin_category = (plan.get("category") or "Other").strip() or "Other"
+        categories_seen.add(coin_category)
+
+        log_this_coin = should_log_coin(ci, len(coins))
+        if log_this_coin:
+            print(f"[{now_str()}] -> [{ci}/{len(coins)}] {sym} ({coin_id}) rank={mkr}")
+
+        plan_error = plan.get("plan_error")
+        if plan_error:
+            print(f"[{now_str()}] [plan][WARN] {coin_id}: {plan_error}")
+            add_coin_stat(ci, skipped_delta=len(slots))
+            continue
+
+        for si, entry in enumerate(plan.get("entries", []), 1):
+            start = entry.get("start")
+            end = entry.get("end")
+            if not isinstance(start, datetime) or not isinstance(end, datetime):
+                add_coin_stat(ci, skipped_delta=1)
+                continue
+
+            if LOG_SLOT_LINES and log_this_coin:
+                print(f"    slot {si}/{len(slots)} {start} -> {end}")
+
+            kind = entry.get("kind")
+            if kind == "existing":
+                apply_existing_agg(coin_id, coin_category, start, end)
+                add_coin_stat(ci, skipped_delta=1)
+                continue
+
+            if kind != "insert":
+                if VERBOSE_MODE and log_this_coin:
+                    reason = entry.get("reason") or "skip"
+                    print(f"        {reason} -> skip")
+                add_coin_stat(ci, skipped_delta=1)
+                continue
+
+            price = float(entry.get("price"))
+            mcap = float(entry.get("mcap") or 0.0)
+            vol = float(entry.get("vol") or 0.0)
+            rank = entry.get("rank")
+            circ = entry.get("circ")
+            totl = entry.get("totl")
+            source = entry.get("source") or "hist-unknown"
+            slot_last_upd = entry.get("slot_last_upd") or (end - timedelta(seconds=1))
 
             try:
-                result = session.execute(
+                fut = session.execute_async(
                     INS_10M_IF_NOT_EXISTS_PS,
                     [coin_id, start, sym, name, price, mcap, vol, rank, circ, totl, slot_last_upd],
-                    timeout=REQUEST_TIMEOUT
-                ).one()
-                applied = bool(getattr(result, 'applied', True)) if result is not None else True
-
-                # accumulate aggregates only in normal append mode, OR if explicitly enabled for gapfill
-                if (run_mode != "gapfill") or GAPFILL_WRITE_AGG:
-                    if applied:
-                        bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                        bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
-                        bump_slot_coin_count(start)
-                    else:
-                        existing_vals = read_existing_slot(coin_id, start, end)
-                        if existing_vals:
-                            mcap_exist, vol_exist, lu_exist = existing_vals
-                            bump_slot_total(start, coin_category, mcap_exist, vol_exist, lu_exist)
-                            bump_slot_total(start, 'ALL',          mcap_exist, vol_exist, lu_exist)
-                            bump_slot_coin_count(start)
-                        else:
-                            # Fallback: avoid dropping totals if the row is unexpectedly missing.
-                            bump_slot_total(start, coin_category, mcap, vol, slot_last_upd)
-                            bump_slot_total(start, 'ALL',          mcap, vol, slot_last_upd)
-                            bump_slot_coin_count(start)
-                            print("        [WARN] insert not applied but existing row missing; aggregated computed values")
-
-                print(f"        insert {'applied' if applied else 'skipped'} "
-                      f"({source}, price={price}, mcap={mcap}, vol={vol}, rank={rank}, circ={circ}, totl={totl}, last_upd={slot_last_upd})")
-
-                if applied: wrote += 1
-                else:       skipped += 1
-
+                    timeout=REQUEST_TIMEOUT,
+                )
+                pending_writes.append(
+                    (
+                        fut,
+                        {
+                            "ci": ci,
+                            "coin_id": coin_id,
+                            "coin_category": coin_category,
+                            "symbol": sym,
+                            "start": start,
+                            "end": end,
+                            "source": source,
+                            "price": price,
+                            "mcap": mcap,
+                            "vol": vol,
+                            "rank": rank,
+                            "circ": circ,
+                            "totl": totl,
+                            "slot_last_upd": slot_last_upd,
+                        },
+                    )
+                )
             except Exception as e:
                 print(f"        [WRITE-ERR] insert {sym} {start}: {e} (skip)")
                 traceback.print_exc()
-                skipped += 1
+                add_coin_stat(ci, skipped_delta=1)
+                continue
+
+            while len(pending_writes) >= WRITE_CONCURRENCY:
+                drain_one_write()
+
+    while pending_writes:
+        drain_one_write()
 
     # Optional aggregate rebuild from stored rows (max stability)
     if (

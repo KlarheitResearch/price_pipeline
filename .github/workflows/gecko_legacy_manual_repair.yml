@@ -95,7 +95,11 @@ jobs:
           CG_CHUNK_HOURS: "72"
         run: |
           set -euo pipefail
-          CMD=(python prices/legacy_backup/GM_gck_manual_repair_intraday.py \
+          CMD=(python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id GM_gck_manual_repair_intraday \
+            --rank-start "${{ github.event.inputs.rank_start }}" \
+            --rank-end "${{ github.event.inputs.rank_end }}" \
+            -- python prices/legacy_backup/GM_gck_manual_repair_intraday.py \
             --rank-start "${{ github.event.inputs.rank_start }}" \
             --rank-end "${{ github.event.inputs.rank_end }}" \
             --from-utc "${{ github.event.inputs.from_utc }}" \

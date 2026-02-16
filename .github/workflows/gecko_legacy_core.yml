@@ -114,11 +114,14 @@ jobs:
           BATCH_FLUSH_EVERY: "50"
           RANK_BUCKET: "all"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/AA_gck_load_prices_live.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id AA_gck_load_prices_live \
+            -- python prices/legacy_backup/AA_gck_load_prices_live.py
 
       - name: CC append 10m from live
         if: env.RUN_10M == 'true'
-        timeout-minutes: 8
+        timeout-minutes: 12
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
@@ -132,8 +135,18 @@ jobs:
           SLOTS_BACKFILL: "4"
           AGG_MIN_COINS: "700"
           AGG_CARRY_FORWARD: "1"
+          PROGRESS_EVERY: "100"
+          COIN_WORKERS: "8"
+          WRITE_CONCURRENCY: "16"
+          APPEND_SKIP_EXISTING: "1"
+          APPEND_AGG_FROM_EXISTING: "0"
+          LOG_SLOT_LINES: "0"
+          LOG_INSERT_LINES: "0"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/CC_gck_append_10m_from_live.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id CC_gck_append_10m_from_live \
+            -- python prices/legacy_backup/CC_gck_append_10m_from_live.py
 
       - name: DD update hourly from 10m
         if: env.RUN_HOURLY == 'true'
@@ -154,7 +167,10 @@ jobs:
           AGG_MIN_COINS: "700"
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/DD_gck_create_hourly_from_10m.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id DD_gck_create_hourly_from_10m \
+            -- python prices/legacy_backup/DD_gck_create_hourly_from_10m.py
 
       - name: EE update daily from 10m
         if: env.RUN_DAILY_10M == 'true'
@@ -174,7 +190,10 @@ jobs:
           AGG_MIN_COINS: "700"
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/EE_gck_create_daily_from_10m.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id EE_gck_create_daily_from_10m \
+            -- python prices/legacy_backup/EE_gck_create_daily_from_10m.py
 
       - name: EG update monthly from daily
         if: env.RUN_MONTHLY == 'true'
@@ -189,4 +208,7 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/EG_gck_update_monthly_from_daily.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id EG_gck_update_monthly_from_daily \
+            -- python prices/legacy_backup/EG_gck_update_monthly_from_daily.py

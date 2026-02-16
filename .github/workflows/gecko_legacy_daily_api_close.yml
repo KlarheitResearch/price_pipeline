@@ -78,4 +78,7 @@ jobs:
           REQUEST_TIMEOUT_SEC: "45"
           CG_BACKOFF_BASE_S: "3"
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
-        run: python prices/legacy_backup/EF_gck_close_daily_topn_api.py
+        run: |
+          python prices/legacy_backup/pipeline_health_runner.py \
+            --script-id EF_gck_close_daily_topn_api \
+            -- python prices/legacy_backup/EF_gck_close_daily_topn_api.py
