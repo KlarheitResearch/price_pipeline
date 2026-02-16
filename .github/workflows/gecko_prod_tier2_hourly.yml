@@ -16,6 +16,22 @@ on:
         description: "Run HH_write_market_caps.py"
         required: false
         default: "false"
+      mcap_top_n:
+        description: "PP_TOP_N for HH_write_market_caps.py"
+        required: false
+        default: "1000"
+      mcap_10m_slots:
+        description: "PP_MCAP_10M_SLOTS for HH_write_market_caps.py"
+        required: false
+        default: "12"
+      mcap_hours:
+        description: "PP_MCAP_HOURS for HH_write_market_caps.py"
+        required: false
+        default: "24"
+      mcap_days:
+        description: "PP_MCAP_DAYS for HH_write_market_caps.py"
+        required: false
+        default: "7"
       run_derivatives:
         description: "Run BB_refresh_live_derivatives.py"
         required: false
@@ -66,6 +82,10 @@ jobs:
       RUN_HOURLY: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_hourly || 'true') }}
       RUN_DAILY: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_daily || 'true') }}
       RUN_MONTHLY: ${{ (github.event_name == 'schedule' && 'true') || (github.event.inputs.run_monthly || 'true') }}
+      MCAP_TOP_N_RESOLVED: ${{ github.event.inputs.mcap_top_n || '1000' }}
+      MCAP_10M_SLOTS_RESOLVED: ${{ github.event.inputs.mcap_10m_slots || '12' }}
+      MCAP_HOURS_RESOLVED: ${{ github.event.inputs.mcap_hours || '24' }}
+      MCAP_DAYS_RESOLVED: ${{ github.event.inputs.mcap_days || '7' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       PP_RANK_START: "201"
       PP_RANK_END: "600"
@@ -205,9 +225,9 @@ jobs:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-          PP_TOP_N: "1000"
-          PP_MCAP_10M_SLOTS: "12"
-          PP_MCAP_HOURS: "24"
-          PP_MCAP_DAYS: "7"
+          PP_TOP_N: ${{ env.MCAP_TOP_N_RESOLVED }}
+          PP_MCAP_10M_SLOTS: ${{ env.MCAP_10M_SLOTS_RESOLVED }}
+          PP_MCAP_HOURS: ${{ env.MCAP_HOURS_RESOLVED }}
+          PP_MCAP_DAYS: ${{ env.MCAP_DAYS_RESOLVED }}
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/HH_write_market_caps.py
