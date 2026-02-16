@@ -49,6 +49,40 @@ SLOTS_10M = 24 * 6
 SLOTS_1H = 24
 
 
+def _parse_source_set(env_name: str, default_csv: str) -> set[str]:
+    raw = (os.getenv(env_name, default_csv) or "").strip()
+    out = set()
+    for part in raw.split(","):
+        src = part.strip().lower()
+        if src:
+            out.add(src)
+    return out
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+TRUSTED_DAILY_SOURCES = _parse_source_set(
+    "PP_AVAIL_TRUSTED_DAILY_SOURCES",
+    "cg_daily_final,cg_daily_bootstrap",
+)
+TRUSTED_HOURLY_SOURCES = _parse_source_set(
+    "PP_AVAIL_TRUSTED_HOURLY_SOURCES",
+    "cg_hourly_final",
+)
+TRUSTED_10M_SOURCES = _parse_source_set(
+    "PP_AVAIL_TRUSTED_10M_SOURCES",
+    "repair_api_points",
+)
+TRUSTED_DAILY_MIN_POINTS = max(0, _int_env("PP_AVAIL_TRUSTED_DAILY_MIN_POINTS", 1))
+TRUSTED_HOURLY_MIN_POINTS = max(0, _int_env("PP_AVAIL_TRUSTED_HOURLY_MIN_POINTS", 1))
+TRUSTED_10M_MIN_POINTS = max(0, _int_env("PP_AVAIL_TRUSTED_10M_MIN_POINTS", 1))
+
+
 def _target_day():
     raw = (os.getenv("PP_AVAIL_TARGET_DAY") or "").strip()
     if raw:
@@ -118,9 +152,13 @@ def _popcount(buf: bytes) -> int:
     return sum(bin(b).count("1") for b in buf)
 
 
-def _scan_intraday(rows, slot_count: int, slot_fn):
+def _scan_intraday(rows, slot_count: int, slot_fn, row_filter):
     by_day = {}
+    skipped_untrusted = 0
     for r in rows:
+        if not row_filter(r):
+            skipped_untrusted += 1
+            continue
         ts = to_utc(getattr(r, "ts", None))
         if ts is None:
             continue
@@ -138,7 +176,7 @@ def _scan_intraday(rows, slot_count: int, slot_fn):
         if ts > e["last_seen"]:
             e["last_seen"] = ts
         _set_bit(e["bitmap"], slot_fn(ts))
-    return by_day
+    return by_day, skipped_untrusted
 
 
 def _slot_idx_10m(ts):
@@ -147,6 +185,39 @@ def _slot_idx_10m(ts):
 
 def _slot_idx_1h(ts):
     return ts.hour
+
+
+def _row_source(row) -> str:
+    return (getattr(row, "candle_source", None) or "").strip().lower()
+
+
+def _row_point_count(row) -> int:
+    raw = getattr(row, "point_count", None)
+    try:
+        return int(raw) if raw is not None else 0
+    except Exception:
+        return 0
+
+
+def _is_trusted_row(row, trusted_sources: set[str], min_points: int) -> bool:
+    if not trusted_sources:
+        return False
+    src = _row_source(row)
+    if src not in trusted_sources:
+        return False
+    return _row_point_count(row) >= max(0, int(min_points))
+
+
+def _is_trusted_daily_row(row) -> bool:
+    return _is_trusted_row(row, TRUSTED_DAILY_SOURCES, TRUSTED_DAILY_MIN_POINTS)
+
+
+def _is_trusted_10m_row(row) -> bool:
+    return _is_trusted_row(row, TRUSTED_10M_SOURCES, TRUSTED_10M_MIN_POINTS)
+
+
+def _is_trusted_1h_row(row) -> bool:
+    return _is_trusted_row(row, TRUSTED_HOURLY_SOURCES, TRUSTED_HOURLY_MIN_POINTS)
 
 
 def main() -> None:
@@ -165,6 +236,12 @@ def main() -> None:
     tracker.set_metric("daily_window_days", DAILY_WINDOW_DAYS)
     tracker.set_metric("intraday_10m_days", INTRADAY_10M_DAYS)
     tracker.set_metric("intraday_hourly_days", INTRADAY_HOURLY_DAYS)
+    tracker.set_metric("trusted_daily_sources", ",".join(sorted(TRUSTED_DAILY_SOURCES)))
+    tracker.set_metric("trusted_hourly_sources", ",".join(sorted(TRUSTED_HOURLY_SOURCES)))
+    tracker.set_metric("trusted_10m_sources", ",".join(sorted(TRUSTED_10M_SOURCES)))
+    tracker.set_metric("trusted_daily_min_points", TRUSTED_DAILY_MIN_POINTS)
+    tracker.set_metric("trusted_hourly_min_points", TRUSTED_HOURLY_MIN_POINTS)
+    tracker.set_metric("trusted_10m_min_points", TRUSTED_10M_MIN_POINTS)
     tracker.start()
     try:
         sel_live = SimpleStatement(
@@ -183,12 +260,14 @@ def main() -> None:
 
         print(
             f"[{now_str()}] Availability update: scope={scope_label()} coins={len(coins)} "
-            f"target_day={target_day} run_daily={RUN_DAILY} run_intraday={RUN_INTRADAY}"
+            f"target_day={target_day} run_daily={RUN_DAILY} run_intraday={RUN_INTRADAY} "
+            f"trusted_daily={sorted(TRUSTED_DAILY_SOURCES)} trusted_hourly={sorted(TRUSTED_HOURLY_SOURCES)} "
+            f"trusted_10m={sorted(TRUSTED_10M_SOURCES)}"
         )
 
         sel_daily = session.prepare(
             f"""
-            SELECT date, price_usd, close, market_cap, volume_24h
+            SELECT date, price_usd, close, market_cap, volume_24h, candle_source, point_count
             FROM {TABLE_DAILY}
             WHERE id=? AND date>=? AND date<=?
             """
@@ -216,14 +295,14 @@ def main() -> None:
 
         sel_10m_range = session.prepare(
             f"""
-            SELECT ts
+            SELECT ts, candle_source, point_count
             FROM {TABLE_10M}
             WHERE id=? AND ts>=? AND ts<?
             """
         )
         sel_hourly_range = session.prepare(
             f"""
-            SELECT ts
+            SELECT ts, candle_source, point_count
             FROM {TABLE_HOURLY}
             WHERE id=? AND ts>=? AND ts<?
             """
@@ -272,6 +351,9 @@ def main() -> None:
         wrote_ranges = 0
         wrote_daily = 0
         wrote_intraday = 0
+        skipped_untrusted_daily = 0
+        skipped_untrusted_10m = 0
+        skipped_untrusted_1h = 0
         hb = Heartbeat("91_update_coin_data_availability")
 
         now_ts = now_utc()
@@ -300,6 +382,9 @@ def main() -> None:
                 have_mcap = set()
 
                 for r in rows:
+                    if not _is_trusted_daily_row(r):
+                        skipped_untrusted_daily += 1
+                        continue
                     d = _to_date(getattr(r, "date", None))
                     if d is None:
                         continue
@@ -368,7 +453,8 @@ def main() -> None:
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
                 )
-                by_day_10m = _scan_intraday(rows_10m, SLOTS_10M, _slot_idx_10m)
+                by_day_10m, skipped_10m = _scan_intraday(rows_10m, SLOTS_10M, _slot_idx_10m, _is_trusted_10m_row)
+                skipped_untrusted_10m += skipped_10m
                 session.execute(del_intraday, [coin.id, G_10M], timeout=REQUEST_TIMEOUT_SEC)
                 for d, entry in by_day_10m.items():
                     bm = bytes(entry["bitmap"])
@@ -393,7 +479,8 @@ def main() -> None:
                         timeout=REQUEST_TIMEOUT_SEC,
                     )
                 )
-                by_day_1h = _scan_intraday(rows_1h, SLOTS_1H, _slot_idx_1h)
+                by_day_1h, skipped_1h = _scan_intraday(rows_1h, SLOTS_1H, _slot_idx_1h, _is_trusted_1h_row)
+                skipped_untrusted_1h += skipped_1h
                 session.execute(del_intraday, [coin.id, G_1H], timeout=REQUEST_TIMEOUT_SEC)
                 for d, entry in by_day_1h.items():
                     bm = bytes(entry["bitmap"])
@@ -415,11 +502,16 @@ def main() -> None:
 
         print(
             f"[{now_str()}] Availability done. wrote_daily_rows={wrote_daily} "
-            f"wrote_daily_ranges={wrote_ranges} wrote_intraday_rows={wrote_intraday}"
+            f"wrote_daily_ranges={wrote_ranges} wrote_intraday_rows={wrote_intraday} "
+            f"skipped_untrusted_daily={skipped_untrusted_daily} "
+            f"skipped_untrusted_10m={skipped_untrusted_10m} skipped_untrusted_1h={skipped_untrusted_1h}"
         )
         tracker.set_metric("rows_daily", wrote_daily)
         tracker.set_metric("rows_daily_ranges", wrote_ranges)
         tracker.set_metric("rows_intraday", wrote_intraday)
+        tracker.set_metric("skipped_untrusted_daily", skipped_untrusted_daily)
+        tracker.set_metric("skipped_untrusted_10m", skipped_untrusted_10m)
+        tracker.set_metric("skipped_untrusted_1h", skipped_untrusted_1h)
         tracker.finish("success")
     except Exception as exc:
         tracker.finish("failed", f"{type(exc).__name__}: {exc}")

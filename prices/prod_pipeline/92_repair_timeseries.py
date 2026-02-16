@@ -50,11 +50,15 @@ REPAIR_LOCK_BUCKET_HOURS = int(os.getenv("PP_REPAIR_LOCK_BUCKET_HOURS", "2"))
 REPAIR_LOCK_TTL_SEC = int(os.getenv("PP_REPAIR_LOCK_TTL_SEC", str(2 * 3600 + 300)))
 TABLE_JOB_LOCKS = os.getenv("PP_TABLE_JOB_LOCKS", "pp_job_locks")
 
-RUN_HOURLY = os.getenv("PP_REPAIR_RUN_HOURLY", "1") == "1"
-RUN_DAILY = os.getenv("PP_REPAIR_RUN_DAILY", "1") == "1"
-RUN_MONTHLY = os.getenv("PP_REPAIR_RUN_MONTHLY", "0") == "1"
-RUN_MCAP = os.getenv("PP_REPAIR_RUN_MCAP", "1") == "1"
+REPAIR_ENABLE_FOLLOWUPS = os.getenv("PP_REPAIR_ENABLE_FOLLOWUPS", "0") == "1"
+RUN_HOURLY = REPAIR_ENABLE_FOLLOWUPS and os.getenv("PP_REPAIR_RUN_HOURLY", "1") == "1"
+RUN_DAILY = REPAIR_ENABLE_FOLLOWUPS and os.getenv("PP_REPAIR_RUN_DAILY", "1") == "1"
+RUN_MONTHLY = REPAIR_ENABLE_FOLLOWUPS and os.getenv("PP_REPAIR_RUN_MONTHLY", "0") == "1"
+RUN_MCAP = REPAIR_ENABLE_FOLLOWUPS and os.getenv("PP_REPAIR_RUN_MCAP", "1") == "1"
 ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
+REPAIR_USE_COVERAGE_PREFILTER = os.getenv("PP_REPAIR_USE_COVERAGE_PREFILTER", "0") == "1"
+TABLE_INTRADAY_COV = os.getenv("PP_TABLE_INTRADAY_COV", "pp_coin_intraday_coverage")
+G_10M = 1
 
 
 class SeriesAccessor:
@@ -172,6 +176,57 @@ def _all_slots(start_ts, end_ts_exclusive):
     return out
 
 
+def _slot_idx_10m(ts) -> int:
+    return ts.hour * 6 + (ts.minute // 10)
+
+
+def _bit_is_set(bitmap: bytes, slot_idx: int) -> bool:
+    if slot_idx < 0:
+        return False
+    bi = slot_idx // 8
+    if bi >= len(bitmap):
+        return False
+    return (bitmap[bi] & (1 << (slot_idx % 8))) != 0
+
+
+def _expected_slots_by_day(slots: list) -> dict:
+    out = {}
+    for slot_start in slots:
+        d = slot_start.date()
+        out.setdefault(d, set()).add(_slot_idx_10m(slot_start))
+    return out
+
+
+def _coverage_marks_window_clean(session, sel_cov_10m, coin_id: str, expected_by_day: dict) -> bool:
+    if not expected_by_day:
+        return False
+    start_day = min(expected_by_day.keys())
+    end_day = max(expected_by_day.keys())
+    rows = list(
+        session.execute(
+            sel_cov_10m,
+            [coin_id, G_10M, start_day, end_day],
+            timeout=REQUEST_TIMEOUT_SEC,
+        )
+    )
+    by_day = {}
+    for r in rows:
+        d = getattr(r, "day", None)
+        bm = getattr(r, "bitmap", None)
+        if d is None or bm is None:
+            continue
+        by_day[d] = bytes(bm)
+
+    for d, want_slots in expected_by_day.items():
+        bm = by_day.get(d)
+        if bm is None:
+            return False
+        for idx in want_slots:
+            if not _bit_is_set(bm, idx):
+                return False
+    return True
+
+
 def _run_followups(base_dir: pathlib.Path):
     steps = []
     if RUN_HOURLY:
@@ -197,7 +252,7 @@ def main() -> None:
         f"[{now_str()}] Repair run start: scope={scope_label()} "
         f"window={window_start.isoformat()}..{window_end.isoformat()} "
         f"interpolate={REPAIR_INTERPOLATE} rewrite_non_api={REPAIR_REWRITE_NON_API} "
-        f"verbose={is_verbose()}"
+        f"followups_enabled={REPAIR_ENABLE_FOLLOWUPS} verbose={is_verbose()}"
     )
 
     session, cluster = connect_astra()
@@ -205,6 +260,8 @@ def main() -> None:
     tracker.set_metric("repair_10m_hours", REPAIR_10M_HOURS)
     tracker.set_metric("repair_interpolate", 1 if REPAIR_INTERPOLATE else 0)
     tracker.set_metric("repair_rewrite_non_api", 1 if REPAIR_REWRITE_NON_API else 0)
+    tracker.set_metric("coverage_prefilter_enabled", 1 if REPAIR_USE_COVERAGE_PREFILTER else 0)
+    tracker.set_metric("followups_enabled", 1 if REPAIR_ENABLE_FOLLOWUPS else 0)
     tracker.set_metric("followup_hourly", 1 if RUN_HOURLY else 0)
     tracker.set_metric("followup_daily", 1 if RUN_DAILY else 0)
     tracker.set_metric("followup_monthly", 1 if RUN_MONTHLY else 0)
@@ -264,12 +321,25 @@ def main() -> None:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         )
+        sel_cov_10m = None
+        if REPAIR_USE_COVERAGE_PREFILTER:
+            sel_cov_10m = session.prepare(
+                f"""
+                SELECT day, bitmap, set_count
+                FROM {TABLE_INTRADAY_COV}
+                WHERE id=? AND granularity=? AND day>=? AND day<=?
+                """
+            )
 
         slots = _all_slots(window_start, window_end)
+        expected_slots_by_day = _expected_slots_by_day(slots)
         hb = Heartbeat("92_repair_timeseries")
         total_missing = 0
         total_non_api_targets = 0
         total_skipped_downgrade = 0
+        coverage_checked_coins = 0
+        coverage_clean_skipped_coins = 0
+        coverage_prefilter_errors = 0
         for idx, coin in enumerate(coins, 1):
             if should_log_progress(idx, len(coins), default_every=100):
                 print(f"[{now_str()}] coin {idx}/{len(coins)} -> {coin.id}")
@@ -281,6 +351,19 @@ def main() -> None:
                     f"[repair] {coin.id}: loading existing 10m rows for "
                     f"{window_start.isoformat()}..{window_end.isoformat()}"
                 )
+
+            if REPAIR_USE_COVERAGE_PREFILTER and sel_cov_10m is not None:
+                coverage_checked_coins += 1
+                try:
+                    if _coverage_marks_window_clean(session, sel_cov_10m, coin.id, expected_slots_by_day):
+                        coverage_clean_skipped_coins += 1
+                        if is_verbose():
+                            vprint(f"[repair] {coin.id}: strict coverage marks window clean; skip coin.")
+                        continue
+                except Exception as exc:
+                    coverage_prefilter_errors += 1
+                    if coverage_prefilter_errors <= 3:
+                        print(f"[{now_str()}] [warn] coverage prefilter failed for {coin.id}: {exc}")
 
             rows = list(
                 session.execute(
@@ -514,13 +597,19 @@ def main() -> None:
         print(
             f"[{now_str()}] Repair done. missing_slots={total_missing} "
             f"non_api_targets={total_non_api_targets} inserted={total_inserted} "
-            f"skipped_downgrade={total_skipped_downgrade}"
+            f"skipped_downgrade={total_skipped_downgrade} "
+            f"coverage_checked={coverage_checked_coins} coverage_clean_skipped={coverage_clean_skipped_coins}"
         )
         tracker.set_metric("missing_slots", total_missing)
         tracker.set_metric("non_api_targets", total_non_api_targets)
         tracker.set_metric("inserted_slots", total_inserted)
         tracker.set_metric("skipped_downgrade", total_skipped_downgrade)
-        planned_followups = int(total_inserted > 0 and (RUN_HOURLY or RUN_DAILY or RUN_MONTHLY or RUN_MCAP))
+        tracker.set_metric("coverage_checked_coins", coverage_checked_coins)
+        tracker.set_metric("coverage_clean_skipped_coins", coverage_clean_skipped_coins)
+        tracker.set_metric("coverage_prefilter_errors", coverage_prefilter_errors)
+        planned_followups = int(
+            REPAIR_ENABLE_FOLLOWUPS and total_inserted > 0 and (RUN_HOURLY or RUN_DAILY or RUN_MONTHLY or RUN_MCAP)
+        )
         tracker.set_metric("followups_planned", planned_followups)
         tracker.finish("success")
     except Exception as exc:
@@ -532,8 +621,10 @@ def main() -> None:
         except Exception:
             pass
 
-    if total_inserted > 0:
+    if total_inserted > 0 and REPAIR_ENABLE_FOLLOWUPS:
         _run_followups(base_dir)
+    elif total_inserted > 0 and not REPAIR_ENABLE_FOLLOWUPS:
+        print(f"[{now_str()}] Repaired inserts present, but follow-ups disabled (PP_REPAIR_ENABLE_FOLLOWUPS=0).")
     else:
         print(f"[{now_str()}] No repaired inserts, skipping follow-up steps.")
 

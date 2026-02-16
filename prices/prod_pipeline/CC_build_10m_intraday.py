@@ -33,6 +33,10 @@ SLOTS_BACKFILL = int(os.getenv("PP_SLOTS_BACKFILL", "4"))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 CC_HEAL_RECENT_SLOTS = int(os.getenv("PP_CC_HEAL_RECENT_SLOTS", "3"))
 CC_HEAL_INTERPOLATE = os.getenv("PP_CC_HEAL_INTERPOLATE", "1") == "1"
+try:
+    CC_HEAL_MIN_POINTS = max(1, int(os.getenv("PP_CC_HEAL_MIN_POINTS", "2")))
+except Exception:
+    CC_HEAL_MIN_POINTS = 2
 
 
 class SeriesAccessor:
@@ -141,12 +145,24 @@ def _can_overwrite(existing_row, new_source: str, new_point_count: int) -> bool:
     return new_q >= old_q
 
 
+def _needs_heal_api(existing_row) -> bool:
+    if existing_row is None:
+        return True
+    src = (getattr(existing_row, "candle_source", None) or "").strip().lower()
+    pts = _f(getattr(existing_row, "point_count", None))
+    pts_i = int(pts) if pts is not None else 0
+    if src in ("", "carry_prev", "repair_carry", "repair_api_interp", "live_partial", "10m_partial"):
+        return True
+    return pts_i < CC_HEAL_MIN_POINTS
+
+
 def main() -> None:
     hb = Heartbeat("CC_build_10m_intraday")
     session, cluster = connect_astra()
     tracker = PipelineHealthTracker(session, "CC_build_10m_intraday")
     tracker.set_metric("slots_backfill", SLOTS_BACKFILL)
     tracker.set_metric("heal_recent_slots", CC_HEAL_RECENT_SLOTS)
+    tracker.set_metric("heal_min_points", CC_HEAL_MIN_POINTS)
     tracker.start()
 
     sel_live = SimpleStatement(
@@ -218,6 +234,8 @@ def main() -> None:
     skipped = 0
     skipped_downgrade = 0
     immediate_healed = 0
+    heal_target_slots = 0
+    heal_api_calls = 0
     try:
         for idx, coin in enumerate(coins, 1):
             if should_log_progress(idx, len(coins), default_every=25):
@@ -320,7 +338,14 @@ def main() -> None:
                     skipped += 1
                     continue
 
-                if slot_start in heal_slot_set and heal_window_start is not None and heal_window_end is not None:
+                slot_needs_api = (
+                    slot_start in heal_slot_set
+                    and heal_window_start is not None
+                    and heal_window_end is not None
+                    and _needs_heal_api(existing_row)
+                )
+                if slot_needs_api:
+                    heal_target_slots += 1
                     if not api_loaded and not api_failed:
                         try:
                             data = cg_market_chart_range(
@@ -351,6 +376,7 @@ def main() -> None:
                                 )
                             )
                             api_loaded = True
+                            heal_api_calls += 1
                         except Exception as exc:
                             api_failed = True
                             print(f"[{now_str()}] [warn] cc-heal API failed for {coin.id}: {exc}")
@@ -460,6 +486,8 @@ def main() -> None:
         tracker.set_metric("rows_skipped", skipped)
         tracker.set_metric("rows_skipped_downgrade", skipped_downgrade)
         tracker.set_metric("rows_healed_api", immediate_healed)
+        tracker.set_metric("heal_target_slots", heal_target_slots)
+        tracker.set_metric("heal_api_calls", heal_api_calls)
         tracker.finish("success")
     except Exception as exc:
         tracker.finish("failed", f"{type(exc).__name__}: {exc}")

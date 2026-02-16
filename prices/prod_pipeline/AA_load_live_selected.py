@@ -99,10 +99,15 @@ def main() -> None:
     if rank_window:
         start_rank, end_rank = rank_window
         per_page = 250
-        pages = int(math.ceil(end_rank / per_page))
-        print(f"[{now_str()}] Loading live prices for scope={scope_label()} across {pages} page(s)")
+        start_page = max(1, ((start_rank - 1) // per_page) + 1)
+        end_page = max(start_page, int(math.ceil(end_rank / per_page)))
+        pages = (end_page - start_page) + 1
+        print(
+            f"[{now_str()}] Loading live prices for scope={scope_label()} "
+            f"across pages {start_page}..{end_page} (count={pages})"
+        )
 
-        for page in range(1, pages + 1):
+        for page in range(start_page, end_page + 1):
             data = cg_get(
                 "/coins/markets",
                 params={
@@ -128,7 +133,8 @@ def main() -> None:
                     cid = row.get("id")
                     if cid:
                         by_id[cid] = row
-            print(f"[{now_str()}] page={page}/{pages} collected={len(by_id)}")
+            page_idx = page - start_page + 1
+            print(f"[{now_str()}] page={page_idx}/{pages} (api_page={page}) collected={len(by_id)}")
 
         rows = list(by_id.values())
     else:
