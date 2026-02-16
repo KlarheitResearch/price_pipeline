@@ -106,8 +106,8 @@ GitHub Actions manual dispatch:
 
 If you want cleaner scheduling (fewer skipped workflow runs), deploy these worker scripts instead of the prod dispatch set:
 
-- `backend/prices/legacy_backup/cloudflare_workers/legacy-core-5m.js`
-- `backend/prices/legacy_backup/cloudflare_workers/legacy-maintenance-daily.js`
+- `backend/prices/legacy_backup/cloudflare/legacy-core-5m.js`
+- `backend/prices/legacy_backup/cloudflare/legacy-maintenance-daily.js`
 
 ## Required env/secrets
 
