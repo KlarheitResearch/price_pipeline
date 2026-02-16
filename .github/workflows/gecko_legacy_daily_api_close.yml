@@ -69,12 +69,13 @@ jobs:
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
-          COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }},${{ secrets.COINGECKO_API_KEY }}"
+          COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
+          COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '100' }}
           TOP_N_AGG_DAILY: ${{ github.event.inputs.TOP_N_AGG_DAILY || '1000' }}
           TARGET_DAY_ISO: ${{ github.event.inputs.TARGET_DAY_ISO || '' }}
           REBUILD_MCAP_DAILY: "1"
           REQUEST_TIMEOUT_SEC: "45"
-          BACKOFF_SEC: "3"
+          CG_BACKOFF_BASE_S: "3"
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
         run: python prices/legacy_backup/EF_gck_close_daily_topn_api.py

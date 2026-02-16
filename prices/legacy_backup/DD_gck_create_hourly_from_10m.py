@@ -29,11 +29,12 @@
 
 import os, time, sys
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, cast, overload
 from collections import defaultdict
 
 # ───────────────────────── Astra connector ─────────────────────────
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 AstraConfig.from_env()  # load .env if present, otherwise use process env
 
 # ───────────────────────── Config ─────────────────────────
@@ -75,6 +76,16 @@ def now_utc() -> datetime:
 
 def now_str() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+@overload
+def ensure_aware_utc(dt: None) -> None:
+    ...
+
+
+@overload
+def ensure_aware_utc(dt: datetime) -> datetime:
+    ...
+
 
 def ensure_aware_utc(dt: datetime | None) -> datetime | None:
     """Make a datetime timezone-aware UTC. Cassandra returns naive UTC."""
@@ -157,7 +168,7 @@ def rebuild_all_from_categories(hour_totals: Dict[Tuple[datetime, str], Dict[str
 
 # ───────────────────────── Session & prepared statements ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
@@ -587,10 +598,10 @@ def main():
                         continue
 
             hourly_upsert_args.append(
-                [c.id, to_cassandra_ts(start), c.symbol, c.name,
+                (c.id, to_cassandra_ts(start), c.symbol, c.name,
                  o, h, l, cl, cl,
                  mcap, vol, rank, circ, tot,
-                 candle_source, to_cassandra_ts(last_upd)]
+                 candle_source, to_cassandra_ts(last_upd))
             )
             hourly_upsert_meta.append(
                 {

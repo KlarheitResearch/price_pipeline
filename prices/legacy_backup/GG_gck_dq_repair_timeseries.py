@@ -572,6 +572,7 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
     if not (BACKFILL_DAILY_FROM_API and need_daily and dt_ranges): return 0
     all_prices, all_mcaps, all_vols = [], [], []
     for (start_dt, end_dt) in dt_ranges:
+        data = {}
         try:
             sd = ensure_utc_dt(start_dt, "start_dt")
             ed = ensure_utc_dt(end_dt, "end_dt")
@@ -733,6 +734,7 @@ def repair_hourly_from_api_or_interp(coin, missing_hours: set[dt.datetime]) -> t
     hours_sorted = sorted([floor_to_hour_utc(h) for h in missing_hours])
     start_dt = floor_to_hour_utc(hours_sorted[0] - dt.timedelta(hours=6))
     end_dt   = floor_to_hour_utc(hours_sorted[-1] + dt.timedelta(hours=7))
+    p_map, mc_map, v_map = {}, {}, {}
 
     # --- choose data source ---
     if FILL_HOURLY_FROM_API:

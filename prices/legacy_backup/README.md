@@ -11,6 +11,7 @@ This folder is now the active runtime basis for the low-API-cost mode.
 - Daily candles: `EE_gck_create_daily_from_10m.py` (from 10m, no CoinGecko).
 - Monthly candles: `EG_gck_update_monthly_from_daily.py` (from daily/live, no CoinGecko).
 - True daily close API enrichment: `EF_gck_close_daily_topn_api.py` for top 100 only (default), once daily.
+- API-key handling for all CoinGecko callers is centralized in `cg_key_pool.py` (AA/BB/CC/DD rotation + cooldown/suspension).
 
 ## Defaults changed
 
@@ -66,4 +67,5 @@ If you want cleaner scheduling (fewer skipped workflow runs), deploy these worke
 
 - `ASTRA_BUNDLE_BASE64`, `ASTRA_TOKEN`, `ASTRA_KEYSPACE`
 - `COINGECKO_API_TIER`
-- `COINGECKO_API_KEY` (or key ring via `COINGECKO_API_KEY_AA/BB/CC/DD` or `COINGECKO_API_KEYS`)
+- `COINGECKO_API_KEY_AA`, `COINGECKO_API_KEY_BB`, `COINGECKO_API_KEY_CC`, `COINGECKO_API_KEY_DD`
+- Optional fallback only: `COINGECKO_API_KEY` + `COINGECKO_ALLOW_GENERIC_KEY_FALLBACK=1`

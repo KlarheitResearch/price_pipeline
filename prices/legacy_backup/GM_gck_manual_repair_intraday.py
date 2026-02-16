@@ -12,15 +12,15 @@ Repairs a chosen rank window and UTC time range for:
 import argparse
 import os
 import time
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from time import perf_counter
+from typing import cast
 
-import requests
 from cassandra.query import BatchStatement, ConsistencyLevel, SimpleStatement
+from cassandra.cluster import Cluster, Session
 
 from astra_connect.connect import AstraConfig, get_session
+from cg_key_pool import build_key_pool, cg_http_get
 
 AstraConfig.from_env()
 
@@ -80,33 +80,6 @@ def parse_utc(value: str, *, end_if_date: bool) -> datetime:
     return dt_
 
 
-def load_api_keys() -> list[str]:
-    keys_csv = (os.getenv("COINGECKO_API_KEYS") or "").strip()
-    keys = [k.strip() for k in keys_csv.split(",") if k.strip()]
-    if not keys:
-        for name in (
-            "COINGECKO_API_KEY",
-            "COINGECKO_API_KEY_AA",
-            "COINGECKO_API_KEY_BB",
-            "COINGECKO_API_KEY_CC",
-            "COINGECKO_API_KEY_DD",
-        ):
-            val = (os.getenv(name) or "").strip()
-            if val:
-                keys.append(val)
-
-    out: list[str] = []
-    seen = set()
-    for k in keys:
-        norm = k
-        if norm.lower().startswith("api key:"):
-            norm = norm.split(":", 1)[1].strip()
-        if norm and norm not in seen:
-            seen.add(norm)
-            out.append(norm)
-    return out
-
-
 @dataclass
 class Coin:
     id: str
@@ -122,102 +95,36 @@ BASE = os.getenv(
     "COINGECKO_BASE_URL",
     "https://api.coingecko.com/api/v3" if API_TIER == "demo" else "https://pro-api.coingecko.com/api/v3",
 )
-HDR = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
-QS = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
+KEY_POOL = build_key_pool()
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
 RETRIES = int(os.getenv("RETRIES", "3"))
-BACKOFF_SEC = float(os.getenv("BACKOFF_SEC", "3"))
-MAX_BACKOFF_SEC = float(os.getenv("MAX_BACKOFF_SEC", "30"))
 PAUSE_PER_CALL_SEC = float(os.getenv("PAUSE_PER_CALL_SEC", "0.05"))
 WRITE_BATCH_SIZE = int(os.getenv("WRITE_BATCH_SIZE", "100"))
 CG_CHUNK_HOURS = int(os.getenv("CG_CHUNK_HOURS", "72"))
-CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
-CG_MAX_RPM = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
 
 TABLE_LIVE = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TABLE_10M = os.getenv("TABLE_OUT", os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d"))
 TABLE_HOURLY = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
-
-API_KEYS = load_api_keys()
-if not API_KEYS:
-    raise SystemExit("Missing CoinGecko key(s). Set COINGECKO_API_KEY or COINGECKO_API_KEYS.")
-
-_req_times = deque()
-_key_index = 0
 _api_calls = 0
-
-
-def pick_key() -> str:
-    global _key_index
-    key = API_KEYS[_key_index % len(API_KEYS)]
-    _key_index += 1
-    return key
-
-
-def throttle() -> None:
-    now = time.time()
-    if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
-        time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1]))
-        now = time.time()
-    cutoff = now - 60.0
-    while _req_times and _req_times[0] < cutoff:
-        _req_times.popleft()
-    if len(_req_times) >= CG_MAX_RPM:
-        sleep_for = 60.0 - (now - _req_times[0]) + 0.01
-        time.sleep(max(0.0, sleep_for))
 
 
 def http_get(path: str, params: dict | None = None) -> dict:
     global _api_calls
-    url = f"{BASE}{path}"
-    p = dict(params or {})
-    last_err = None
-
-    for attempt in range(1, RETRIES + 1):
-        key = pick_key()
-        headers = {}
-        if API_TIER == "demo":
-            p[QS] = key
-        else:
-            headers[HDR] = key
-
-        throttle()
-        t0 = perf_counter()
-        try:
-            res = requests.get(url, params=p, headers=headers, timeout=REQUEST_TIMEOUT)
-            _req_times.append(time.time())
-            _api_calls += 1
-
-            if res.status_code in (401, 403):
-                last_err = RuntimeError(f"auth error {res.status_code}: {res.text[:180]}")
-                continue
-            if res.status_code in (402, 429, 500, 502, 503, 504):
-                ra = res.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait_s = float(ra)
-                    except Exception:
-                        wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-                else:
-                    wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-                print(f"[{now_str()}] API {path} -> {res.status_code}; wait {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-                time.sleep(wait_s)
-                last_err = RuntimeError(f"{res.status_code} {res.reason}")
-                continue
-
-            res.raise_for_status()
-            dt = perf_counter() - t0
-            print(f"[{now_str()}] API OK {path} in {dt:.2f}s")
-            return res.json()
-        except Exception as e:
-            last_err = e
-            wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-            print(f"[{now_str()}] API error {path}: {e}; wait {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-            time.sleep(wait_s)
-
-    raise RuntimeError(f"CoinGecko failed: {url} :: {last_err}")
+    _api_calls += 1
+    t0 = time.perf_counter()
+    out = cg_http_get(
+        base_url=BASE,
+        path=path,
+        params=params,
+        retries=RETRIES,
+        timeout_sec=REQUEST_TIMEOUT,
+        key_pool=KEY_POOL,
+    )
+    dt = time.perf_counter() - t0
+    print(f"[{now_str()}] API OK {path} in {dt:.2f}s")
+    return out
 
 
 def fetch_market_chart_range(coin_id: str, start_dt: datetime, end_dt: datetime) -> tuple[list, list, list]:
@@ -328,13 +235,13 @@ def main() -> None:
     print(
         f"[{now_str()}] Manual repair config: ranks={rank_start}-{rank_end}, "
         f"window={start_dt.isoformat()} -> {end_dt.isoformat()}, granularity={args.granularity}, "
-        f"overwrite={args.overwrite_existing}, dry_run={dry_run}, keys={len(API_KEYS)}, tier={API_TIER}"
+        f"overwrite={args.overwrite_existing}, dry_run={dry_run}, keys={len(KEY_POOL.keys)}, tier={API_TIER}"
     )
     if do_10m and (end_dt - start_dt) > timedelta(days=7):
         print(f"[{now_str()}] WARN: 10m table is typically 7d-scoped; range exceeds 7 days.")
 
     print(f"[{now_str()}] Connecting to Astra...")
-    session, cluster = get_session(return_cluster=True)
+    session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
     print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
     sel_live = SimpleStatement(

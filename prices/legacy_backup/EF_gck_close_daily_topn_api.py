@@ -15,14 +15,14 @@ Writes:
 
 import os
 import time
-from collections import deque
 from datetime import date, datetime, timedelta, timezone
-from time import perf_counter
+from typing import cast
 
-import requests
 from cassandra.query import BatchStatement, ConsistencyLevel, SimpleStatement
+from cassandra.cluster import Cluster, Session
 
 from astra_connect.connect import AstraConfig, get_session
+from cg_key_pool import build_key_pool, cg_http_get
 
 AstraConfig.from_env()
 
@@ -80,40 +80,11 @@ def day_bounds_utc(d: date) -> tuple[datetime, datetime]:
     return s, s + timedelta(days=1)
 
 
-def load_api_keys() -> list[str]:
-    keys_csv = (os.getenv("COINGECKO_API_KEYS") or "").strip()
-    keys = [k.strip() for k in keys_csv.split(",") if k.strip()]
-    if not keys:
-        for name in (
-            "COINGECKO_API_KEY",
-            "COINGECKO_API_KEY_AA",
-            "COINGECKO_API_KEY_BB",
-            "COINGECKO_API_KEY_CC",
-            "COINGECKO_API_KEY_DD",
-        ):
-            val = (os.getenv(name) or "").strip()
-            if val:
-                keys.append(val)
-
-    out: list[str] = []
-    seen = set()
-    for k in keys:
-        norm = k
-        if norm.lower().startswith("api key:"):
-            norm = norm.split(":", 1)[1].strip()
-        if norm and norm not in seen:
-            seen.add(norm)
-            out.append(norm)
-    return out
-
-
 TOP_N = int(os.getenv("TOP_N_API_DAILY", "100"))
 TOP_N_AGG = int(os.getenv("TOP_N_AGG_DAILY", "1000"))
 FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 RETRIES = int(os.getenv("RETRIES", "3"))
-BACKOFF_SEC = float(os.getenv("BACKOFF_SEC", "3"))
-MAX_BACKOFF_SEC = float(os.getenv("MAX_BACKOFF_SEC", "30"))
 PAUSE_PER_COIN_SEC = float(os.getenv("PAUSE_PER_COIN_SEC", "0.05"))
 WRITE_BATCH_SIZE = int(os.getenv("WRITE_BATCH_SIZE", "50"))
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
@@ -124,94 +95,31 @@ BASE = os.getenv(
     "COINGECKO_BASE_URL",
     "https://api.coingecko.com/api/v3" if API_TIER == "demo" else "https://pro-api.coingecko.com/api/v3",
 )
-HDR = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
-QS = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
-CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
-CG_MAX_RPM = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
+KEY_POOL = build_key_pool()
 
 TABLE_LIVE = os.getenv("TABLE_LIVE", "gecko_prices_live")
 TABLE_DAILY = os.getenv("DAILY_TABLE", os.getenv("TABLE_DAILY", "gecko_candles_daily_contin"))
 TABLE_MCAP_DAILY = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 
-API_KEYS = load_api_keys()
-if not API_KEYS:
-    raise SystemExit("Missing CoinGecko key(s). Set COINGECKO_API_KEY or COINGECKO_API_KEYS.")
-
 print(
     f"[{now_str()}] Config: top_n={TOP_N}, top_n_agg={TOP_N_AGG}, dry_run={DRY_RUN}, "
-    f"rebuild_mcap_daily={REBUILD_MCAP_DAILY}, keys={len(API_KEYS)}, tier={API_TIER}"
+    f"rebuild_mcap_daily={REBUILD_MCAP_DAILY}, keys={len(KEY_POOL.keys)}, tier={API_TIER}"
 )
-
-_req_times = deque()
-_key_index = 0
-
-
-def pick_key() -> str:
-    global _key_index
-    k = API_KEYS[_key_index % len(API_KEYS)]
-    _key_index += 1
-    return k
-
-
-def throttle() -> None:
-    now = time.time()
-    if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
-        time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1]))
-        now = time.time()
-    cutoff = now - 60.0
-    while _req_times and _req_times[0] < cutoff:
-        _req_times.popleft()
-    if len(_req_times) >= CG_MAX_RPM:
-        sleep_for = 60.0 - (now - _req_times[0]) + 0.01
-        time.sleep(max(0.0, sleep_for))
 
 
 def http_get(path: str, params: dict | None = None) -> dict:
-    url = f"{BASE}{path}"
-    p = dict(params or {})
-    last_err = None
-
-    for attempt in range(1, RETRIES + 1):
-        key = pick_key()
-        headers = {}
-        if API_TIER == "demo":
-            p[QS] = key
-        else:
-            headers[HDR] = key
-
-        throttle()
-        t0 = perf_counter()
-        try:
-            res = requests.get(url, params=p, headers=headers, timeout=REQUEST_TIMEOUT)
-            _req_times.append(time.time())
-            if res.status_code in (401, 403):
-                last_err = RuntimeError(f"auth error {res.status_code}: {res.text[:180]}")
-                continue
-            if res.status_code in (402, 429, 500, 502, 503, 504):
-                ra = res.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait_s = float(ra)
-                    except Exception:
-                        wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-                else:
-                    wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-                print(f"[{now_str()}] API {path} -> {res.status_code}; wait {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-                time.sleep(wait_s)
-                last_err = RuntimeError(f"{res.status_code} {res.reason}")
-                continue
-
-            res.raise_for_status()
-            dt = perf_counter() - t0
-            print(f"[{now_str()}] API OK {path} in {dt:.2f}s")
-            return res.json()
-        except Exception as e:
-            last_err = e
-            wait_s = min(MAX_BACKOFF_SEC, BACKOFF_SEC * (2 ** (attempt - 1)))
-            print(f"[{now_str()}] API error {path}: {e}; wait {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-            time.sleep(wait_s)
-
-    raise RuntimeError(f"CoinGecko failed: {url} :: {last_err}")
+    t0 = time.perf_counter()
+    out = cg_http_get(
+        base_url=BASE,
+        path=path,
+        params=params,
+        retries=RETRIES,
+        timeout_sec=REQUEST_TIMEOUT,
+        key_pool=KEY_POOL,
+    )
+    dt = time.perf_counter() - t0
+    print(f"[{now_str()}] API OK {path} in {dt:.2f}s")
+    return out
 
 
 def bucket_daily_payload(payload: dict, target_day: date) -> dict | None:
@@ -254,7 +162,7 @@ def bucket_daily_payload(payload: dict, target_day: date) -> dict | None:
 
 
 print(f"[{now_str()}] Connecting to Astra...")
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 SEL_LIVE = SimpleStatement(

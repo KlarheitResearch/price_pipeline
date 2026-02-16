@@ -3,9 +3,10 @@
 
 import os
 from datetime import datetime, date, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, cast
 
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 from cassandra.query import SimpleStatement
 
 AstraConfig.from_env()  # load .env or process env
@@ -226,7 +227,7 @@ def write_monthly_row(session, ins_ps, sel_ps, coin, ym: str, agg: Dict[str, Any
 
 def main():
     print(f"[{now_str()}] Connecting to Astra…")
-    session, cluster = get_session(return_cluster=True)
+    session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
     print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
     sel_live = SimpleStatement(

@@ -24,11 +24,12 @@ from __future__ import annotations
 import os
 from time import perf_counter, sleep
 from datetime import datetime, timezone, timedelta, date as dtdate
-from typing import Dict, Optional, Tuple, Iterable, DefaultDict
+from typing import Dict, Optional, Tuple, Iterable, DefaultDict, cast
 from collections import defaultdict
 
 from astra_connect.connect import get_session
 from cassandra import ConsistencyLevel
+from cassandra.cluster import Cluster, Session
 
 # ────────────────────────── Config ──────────────────────────
 KS = os.getenv("KEYSPACE", os.getenv("ASTRA_KEYSPACE", "default_keyspace")).strip()
@@ -157,7 +158,7 @@ def main() -> None:
     AstraConfig.from_env()  # ← required to load creds/secure bundle/keyspace
 
     log("Connecting to Astra…")
-    session, cluster = get_session(return_cluster=True)
+    session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
     log("Connected.")
 
     try:
@@ -415,7 +416,7 @@ def main() -> None:
                         merged[i] = (old_ba[i] if i < len(old_ba) else 0) | (new_bits[i] if i < len(new_bits) else 0)
                     if bytes(merged) == bytes(old_ba):
                         continue
-                    count = popcount(merged)
+                    count = popcount(bytes(merged))
                     first_seen = fs or now_ts
                     last_seen  = now_ts
                     exec_timed(
@@ -443,7 +444,7 @@ def main() -> None:
                         merged[i] = (old_ba[i] if i < len(old_ba) else 0) | (new_bits[i] if i < len(new_bits) else 0)
                     if bytes(merged) == bytes(old_ba):
                         continue
-                    count = popcount(merged)
+                    count = popcount(bytes(merged))
                     first_seen = fs or now_ts
                     last_seen  = now_ts
                     exec_timed(

@@ -1,6 +1,8 @@
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement, BatchStatement
+from typing import cast
 
 from dq_config import (
     TABLE_LIVE,
@@ -18,7 +20,7 @@ from dq_config import (
 )
 
 AstraConfig.from_env()  # required to load creds/secure bundle/keyspace
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 
 def exec_ps(ps, params, timeout=REQUEST_TIMEOUT, fetch_size=FETCH_SIZE):
     """Bind with fetch_size and execute to avoid buffering entire partitions."""

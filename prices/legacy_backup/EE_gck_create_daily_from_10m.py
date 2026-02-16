@@ -3,10 +3,11 @@
 
 import os, time
 from datetime import datetime, timedelta, timezone, date
-from typing import Dict, Tuple, Any, List
+from typing import Dict, Tuple, Any, List, cast, overload
 
 # Astra connector
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 AstraConfig.from_env()  # loads .env if present, otherwise uses process env
 
 # Config
@@ -44,6 +45,16 @@ def now_utc() -> datetime:
 
 def now_str() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S")
+
+@overload
+def ensure_aware_utc(dt: None) -> None:
+    ...
+
+
+@overload
+def ensure_aware_utc(dt: datetime) -> datetime:
+    ...
+
 
 def ensure_aware_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
@@ -102,7 +113,7 @@ def equalish(a, b):
         return False
 
 print(f"[{now_str()}] Connecting to Astra...")
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
@@ -425,7 +436,11 @@ def main():
     
         for d in final_days:
             bucket = buckets.get(d)
-            price_count = bucket["price_count"] if bucket else 0
+            if bucket is None:
+                aggregate_existing(d)
+                skipped += 1
+                continue
+            price_count = bucket["price_count"]
             if price_count < MIN_10M_POINTS_FOR_FINAL:
                 if VERBOSE_MODE:
                     print(
@@ -517,7 +532,11 @@ def main():
         if partial_needed:
             d = today
             bucket = buckets.get(d)
-            price_count = bucket["price_count"] if bucket else 0
+            if bucket is None:
+                aggregate_existing(d)
+                empty += 1
+                continue
+            price_count = bucket["price_count"]
             if price_count == 0:
                 aggregate_existing(d)
                 empty += 1

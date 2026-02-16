@@ -17,10 +17,11 @@
 
 import os, traceback
 from datetime import datetime, timedelta, timezone
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, cast, overload
 
 # ───────────────────────── Astra connector ─────────────────────────
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
@@ -66,7 +67,19 @@ TABLE_MCAP_OUT     = os.getenv("TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+@overload
+def to_utc(x: None) -> None:
+    ...
+
+
+@overload
 def to_utc(x: datetime) -> datetime:
+    ...
+
+
+def to_utc(x: datetime | None) -> datetime | None:
+    if x is None:
+        return None
     if x.tzinfo is None:
         return x.replace(tzinfo=timezone.utc)
     return x.astimezone(timezone.utc)
@@ -115,12 +128,13 @@ def lock_bucket_utc(bucket_hours: int) -> str:
 
 # ───────────────────────── Session & prepared statements ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 from cassandra.query import SimpleStatement
 
-KEYSPACE = (os.getenv("ASTRA_KEYSPACE") or session.keyspace).strip() or session.keyspace
+session_keyspace = (session.keyspace or "").strip()
+KEYSPACE = ((os.getenv("ASTRA_KEYSPACE") or session_keyspace).strip() or session_keyspace or "default_keyspace")
 
 SEL_COINS = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",

@@ -4,9 +4,10 @@
 import os
 from time import perf_counter
 from datetime import datetime, timezone, date, timedelta
-from typing import Dict, Any, Optional, Iterable, Tuple
+from typing import Dict, Any, Optional, Iterable, Tuple, cast
 
 from astra_connect.connect import get_session, AstraConfig
+from cassandra.cluster import Cluster, Session
 from cassandra.query import SimpleStatement
 
 AstraConfig.from_env()  # load .env or process env
@@ -152,7 +153,7 @@ def aggregate_months(rows: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
 
 def main():
     log("Connecting to Astra…")
-    session, cluster = get_session(return_cluster=True)
+    session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
     log(f"Connected. keyspace='{session.keyspace}'")
 
     sel_live = SimpleStatement(

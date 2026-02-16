@@ -99,7 +99,8 @@ jobs:
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
           ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
-          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY_AA != '' && secrets.COINGECKO_API_KEY_AA || secrets.COINGECKO_API_KEY }}
+          COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
+          COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
 
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           RANK_TOP_N: "${{ env.RANK_TOP_N_RESOLVED }}"
@@ -107,8 +108,7 @@ jobs:
           STALE_WARN_MINUTES: "10"
           REQUIRED_LIVE_MIN: "700"
           RETRIES: "3"
-          BACKOFF_MIN: "5"
-          MAX_BACKOFF_MIN: "30"
+          CG_BACKOFF_BASE_S: "5"
           REQUEST_TIMEOUT_SEC: "60"
           CONNECT_TIMEOUT_SEC: "15"
           BATCH_FLUSH_EVERY: "50"

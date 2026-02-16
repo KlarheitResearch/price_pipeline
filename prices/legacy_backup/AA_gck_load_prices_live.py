@@ -11,15 +11,16 @@
 # - We log WARN if last_updated is older than STALE_WARN_MINUTES.
 # - Safe refresh: only truncate/clear once we have enough fresh rows buffered.
 
-import os, time, csv, requests
-from collections import deque
+import os, csv
 from datetime import datetime, timezone, timedelta
-from time import perf_counter
 import math
 import pathlib
+from typing import Any, cast
 
 # ───────────────────────── Astra connector ─────────────────────────
 from astra_connect.connect import get_session, AstraConfig
+from cg_key_pool import build_key_pool, cg_http_get
+from cassandra.cluster import Cluster, Session
 
 # Load env (from .env if present, else process env), validate bundle/token
 AstraConfig.from_env()
@@ -27,8 +28,6 @@ AstraConfig.from_env()
 # ───────────────────────── Config ─────────────────────────
 TOP_N        = int(os.getenv("TOP_N", "1000"))
 RETRIES      = int(os.getenv("RETRIES", "3"))
-BACKOFF_MIN  = int(os.getenv("BACKOFF_MIN", "5"))
-MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))
 
 REQUEST_TIMEOUT_SEC   = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 BATCH_FLUSH_EVERY     = int(os.getenv("BATCH_FLUSH_EVERY", "40"))
@@ -59,24 +58,12 @@ CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(_DEFAULT_CATEGORY_FILE))
 
 # CoinGecko
 API_TIER   = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()  # "demo" | "pro"
-API_KEY    = (os.getenv("COINGECKO_API_KEY") or "").strip()
-if API_KEY.lower().startswith("api key:"):
-    API_KEY = API_KEY.split(":", 1)[1].strip()
-
 BASE = os.getenv(
     "COINGECKO_BASE_URL",
     "https://api.coingecko.com/api/v3" if API_TIER == "demo" else "https://pro-api.coingecko.com/api/v3"
 )
-HDR  = "x-cg-demo-api-key" if API_TIER == "demo" else "x-cg-pro-api-key"
-QS   = "x_cg_demo_api_key" if API_TIER == "demo" else "x_cg_pro_api_key"
-
-# polite rate-limiting (keeps you out of trouble on free/pro tiers)
-CG_REQ_INTERVAL_S = float(os.getenv("CG_REQUEST_INTERVAL_S", "1.0" if API_TIER == "demo" else "0.25"))
-CG_MAX_RPM        = int(os.getenv("CG_MAX_RPM", "50" if API_TIER == "demo" else "120"))
-_req_times = deque()  # timestamps of last requests (seconds)
-
-if not API_KEY:
-    raise SystemExit("Missing COINGECKO_API_KEY")
+KEY_POOL = build_key_pool()
+print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [cg] key pool size={len(KEY_POOL.keys)}")
 
 def now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -91,11 +78,14 @@ def load_category_map(path: str) -> tuple[dict, dict]:
             for delim in [",", ";", "\t", "|"]:
                 f.seek(0)
                 reader = csv.DictReader(f, delimiter=delim)
-                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+                fieldnames = reader.fieldnames
+                if not fieldnames:
+                    continue
+                headers = [h.strip().lower() for h in fieldnames]
                 if "category" in headers and ("id" in headers or "symbol" in headers):
-                    id_key = reader.fieldnames[headers.index("id")] if "id" in headers else None
-                    sym_key = reader.fieldnames[headers.index("symbol")] if "symbol" in headers else None
-                    cat_key = reader.fieldnames[headers.index("category")]
+                    id_key = fieldnames[headers.index("id")] if "id" in headers else None
+                    sym_key = fieldnames[headers.index("symbol")] if "symbol" in headers else None
+                    cat_key = fieldnames[headers.index("category")]
                     for row in reader:
                         cat = (row.get(cat_key) or "").strip()
                         if id_key:
@@ -138,7 +128,7 @@ def category_for(coin_id, sym) -> str:
 
 # ───────────────────────── Connect via shared helper ─────────────────────────
 print(f"[{now_str()}] Connecting to Astra…")
-session, cluster = get_session(return_cluster=True)
+session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
 print(f"[{now_str()}] Connected. keyspace='{session.keyspace}'")
 
 # ───────────────────────── Helpers ─────────────────────────
@@ -156,60 +146,15 @@ def safe_iso_to_dt(s):
         return None
 
 # ─────────── polite throttle + robust GET with backoff / Retry-After ───────────
-def _throttle():
-    now = time.time()
-    # spacing between requests
-    if _req_times and (now - _req_times[-1]) < CG_REQ_INTERVAL_S:
-        time.sleep(CG_REQ_INTERVAL_S - (now - _req_times[-1]))
-        now = time.time()
-    # enforce per-minute cap
-    cutoff = now - 60.0
-    while _req_times and _req_times[0] < cutoff:
-        _req_times.popleft()
-    if len(_req_times) >= CG_MAX_RPM:
-        sleep_for = 60.0 - (now - _req_times[0]) + 0.01
-        time.sleep(max(0.0, sleep_for))
-
 def http_get(path, params=None):
-    url = f"{BASE}{path}"
-    params = dict(params or {})
-    headers = {HDR: API_KEY}
-    params[QS] = API_KEY
-    last_err = None
-    for attempt in range(1, RETRIES + 1):
-        _throttle()
-        t0 = perf_counter()
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC)
-            # handle rate/backpressure classes explicitly
-            if r.status_code in (402, 429, 500, 502, 503, 504):
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait_s = float(ra)
-                    except Exception:
-                        wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-                else:
-                    wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-                print(f"[{now_str()}] [fetch] {path} → {r.status_code}; sleeping {wait_s:.1f}s (retry {attempt}/{RETRIES})")
-                time.sleep(wait_s)
-                last_err = requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
-                continue
-
-            r.raise_for_status()
-            dt_sec = perf_counter() - t0
-            if VERBOSE_MODE:
-                print(f"[{now_str()}] [fetch] OK {path} in {dt_sec:.2f}s")
-            _req_times.append(time.time())
-            return r.json()
-
-        except (requests.ConnectionError, requests.Timeout) as e:
-            last_err = e
-            wait_s = min(MAX_BACKOFF, BACKOFF_MIN * (2 ** (attempt - 1)))
-            print(f"[{now_str()}] [fetch] {path} conn/timeout: {e} — backoff {wait_s:.1f}s")
-            time.sleep(wait_s)
-
-    raise RuntimeError(f"CoinGecko failed: {url} :: {last_err}")
+    return cg_http_get(
+        base_url=BASE,
+        path=path,
+        params=params,
+        retries=RETRIES,
+        timeout_sec=REQUEST_TIMEOUT_SEC,
+        key_pool=KEY_POOL,
+    )
 
 def fmt_rank(r):
     try:
@@ -268,11 +213,11 @@ INS_MCAP_LIVE_UPSERT = session.prepare(
 )
 
 # ───────────────────────── Fetch ─────────────────────────
-def fetch_top_markets(limit: int) -> list:
+def fetch_top_markets(limit: int) -> list[dict[str, Any]]:
     per_page = 250  # MUST stay constant across pages
     pages = math.ceil(limit / per_page)
 
-    out = []
+    out: list[dict[str, Any]] = []
     seen = set()
 
     base_params = {
@@ -287,13 +232,16 @@ def fetch_top_markets(limit: int) -> list:
         params = dict(base_params)
         params["page"] = page
 
-        data = http_get("/coins/markets", params=params) or []
+        payload = http_get("/coins/markets", params=params) or []
+        data = payload if isinstance(payload, list) else []
         print(f"[{now_str()}] [fetch] page={page} got={len(data)} (want_total={limit})")
 
         if not data:
             break
 
         for c in data:
+            if not isinstance(c, dict):
+                continue
             gid = c.get("id")
             if not gid or gid in seen:
                 continue
