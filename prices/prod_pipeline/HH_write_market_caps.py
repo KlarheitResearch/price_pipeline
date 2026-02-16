@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from collections import deque
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from cassandra.query import SimpleStatement
@@ -34,9 +34,12 @@ TABLE_MCAP_HOURLY = os.getenv("PP_TABLE_MCAP_HOURLY", "pp_market_cap_hourly_30d"
 TABLE_MCAP_DAILY = os.getenv("PP_TABLE_MCAP_DAILY", "pp_market_cap_daily_contin")
 
 PP_TOP_N = int(os.getenv("PP_TOP_N", "1000"))
-MCAP_10M_SLOTS = int(os.getenv("PP_MCAP_10M_SLOTS", "12"))
-MCAP_HOURS = int(os.getenv("PP_MCAP_HOURS", "24"))
-MCAP_DAYS = int(os.getenv("PP_MCAP_DAYS", "7"))
+MCAP_10M_SLOTS = max(1, int(os.getenv("PP_MCAP_10M_SLOTS", "12")))
+MCAP_HOURS = max(1, int(os.getenv("PP_MCAP_HOURS", "24")))
+MCAP_DAYS = max(1, int(os.getenv("PP_MCAP_DAYS", "7")))
+MCAP_10M_CARRY_HOURS = max(0, int(os.getenv("PP_MCAP_10M_CARRY_HOURS", "8")))
+MCAP_HOURLY_CARRY_HOURS = max(0, int(os.getenv("PP_MCAP_HOURLY_CARRY_HOURS", "12")))
+MCAP_DAILY_CARRY_DAYS = max(0, int(os.getenv("PP_MCAP_DAILY_CARRY_DAYS", "3")))
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 
@@ -46,6 +49,37 @@ def _f(x):
         return float(x) if x is not None else 0.0
     except Exception:
         return 0.0
+
+
+def _to_date_key(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    year = getattr(value, "year", None)
+    month = getattr(value, "month", None)
+    day_num = getattr(value, "day", None)
+    if isinstance(year, int) and isinstance(month, int) and isinstance(day_num, int):
+        try:
+            return date(year, month, day_num)
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if "T" in text:
+            text = text.split("T", 1)[0]
+        try:
+            return date.fromisoformat(text)
+        except Exception:
+            return None
+
+    return None
 
 
 def rank_map(cat_to_mcap: dict[str, float]) -> dict[str, int]:
@@ -64,6 +98,9 @@ def main() -> None:
     tracker.set_metric("mcap_10m_slots", MCAP_10M_SLOTS)
     tracker.set_metric("mcap_hours", MCAP_HOURS)
     tracker.set_metric("mcap_days", MCAP_DAYS)
+    tracker.set_metric("mcap_10m_carry_hours", MCAP_10M_CARRY_HOURS)
+    tracker.set_metric("mcap_hourly_carry_hours", MCAP_HOURLY_CARRY_HOURS)
+    tracker.set_metric("mcap_daily_carry_days", MCAP_DAILY_CARRY_DAYS)
     tracker.start()
     try:
         sel_live = SimpleStatement(
@@ -87,12 +124,21 @@ def main() -> None:
         now_ts = now_utc()
         end_10m = floor_10m(now_ts) + timedelta(minutes=10)
         start_10m = end_10m - timedelta(minutes=10 * MCAP_10M_SLOTS)
+        carry_10m = timedelta(hours=MCAP_10M_CARRY_HOURS) if MCAP_10M_CARRY_HOURS > 0 else None
+        query_start_10m = start_10m - carry_10m if carry_10m is not None else start_10m
+        slots_10m = [start_10m + timedelta(minutes=10 * i) for i in range(MCAP_10M_SLOTS)]
 
         end_hour = floor_hour(now_ts) + timedelta(hours=1)
         start_hour = end_hour - timedelta(hours=MCAP_HOURS)
+        carry_hour = timedelta(hours=MCAP_HOURLY_CARRY_HOURS) if MCAP_HOURLY_CARRY_HOURS > 0 else None
+        query_start_hour = start_hour - carry_hour if carry_hour is not None else start_hour
+        slots_hour = [start_hour + timedelta(hours=i) for i in range(MCAP_HOURS)]
 
         end_day = now_ts.date()
         start_day = end_day - timedelta(days=MCAP_DAYS - 1)
+        carry_day = timedelta(days=MCAP_DAILY_CARRY_DAYS) if MCAP_DAILY_CARRY_DAYS > 0 else None
+        query_start_day = start_day - carry_day if carry_day is not None else start_day
+        slots_day = [start_day + timedelta(days=i) for i in range(MCAP_DAYS)]
 
         sel_10m = session.prepare(
             f"""
@@ -151,6 +197,62 @@ def main() -> None:
             if lu is not None and (e["lu"] is None or lu > e["lu"]):
                 e["lu"] = lu
 
+        def sort_ts_rows(rows):
+            out: list[tuple[Any, Any]] = []
+            for r in rows:
+                ts = to_utc(getattr(r, "ts", None))
+                if ts is None:
+                    continue
+                out.append((ts, r))
+            out.sort(key=lambda t: t[0])
+            return out
+
+        def sort_day_rows(rows):
+            out: list[tuple[Any, Any]] = []
+            for r in rows:
+                d = _to_date_key(getattr(r, "date", None))
+                if d is None:
+                    continue
+                out.append((d, r))
+            out.sort(key=lambda t: t[0])
+            return out
+
+        def bump_ts_with_carry(target, bucket_ts, cat, sorted_rows, max_age):
+            pos = 0
+            last: tuple[Any, Any] | None = None
+            for ts in bucket_ts:
+                while pos < len(sorted_rows) and sorted_rows[pos][0] <= ts:
+                    last = sorted_rows[pos]
+                    pos += 1
+                if last is None:
+                    continue
+                src_ts, src_row = last
+                if max_age is not None and (ts - src_ts) > max_age:
+                    continue
+                mcap = getattr(src_row, "market_cap", None)
+                vol = getattr(src_row, "volume_24h", None)
+                lu = getattr(src_row, "last_updated", None)
+                bump(target, ts, cat, mcap, vol, lu)
+                bump(target, ts, "ALL", mcap, vol, lu)
+
+        def bump_day_with_carry(target, bucket_days, cat, sorted_rows, max_age):
+            pos = 0
+            last: tuple[Any, Any] | None = None
+            for d in bucket_days:
+                while pos < len(sorted_rows) and sorted_rows[pos][0] <= d:
+                    last = sorted_rows[pos]
+                    pos += 1
+                if last is None:
+                    continue
+                src_day, src_row = last
+                if max_age is not None and (d - src_day) > max_age:
+                    continue
+                mcap = getattr(src_row, "market_cap", None)
+                vol = getattr(src_row, "volume_24h", None)
+                lu = getattr(src_row, "last_updated", None)
+                bump(target, d, cat, mcap, vol, lu)
+                bump(target, d, "ALL", mcap, vol, lu)
+
         for idx, coin in enumerate(coins, 1):
             cid = coin.id
             cat = (getattr(coin, "category", None) or "Other").strip() or "Other"
@@ -160,39 +262,24 @@ def main() -> None:
 
             rows10 = session.execute(
                 sel_10m,
-                [cid, to_cassandra_ts(start_10m), to_cassandra_ts(end_10m)],
+                [cid, to_cassandra_ts(query_start_10m), to_cassandra_ts(end_10m)],
                 timeout=REQUEST_TIMEOUT_SEC,
             )
-            for r in rows10:
-                ts = to_utc(getattr(r, "ts", None))
-                if ts is None:
-                    continue
-                bump(agg10, ts, cat, r.market_cap, r.volume_24h, r.last_updated)
-                bump(agg10, ts, "ALL", r.market_cap, r.volume_24h, r.last_updated)
+            bump_ts_with_carry(agg10, slots_10m, cat, sort_ts_rows(rows10), carry_10m)
 
             rowsH = session.execute(
                 sel_hourly,
-                [cid, to_cassandra_ts(start_hour), to_cassandra_ts(end_hour)],
+                [cid, to_cassandra_ts(query_start_hour), to_cassandra_ts(end_hour)],
                 timeout=REQUEST_TIMEOUT_SEC,
             )
-            for r in rowsH:
-                ts = to_utc(getattr(r, "ts", None))
-                if ts is None:
-                    continue
-                bump(aggH, ts, cat, r.market_cap, r.volume_24h, r.last_updated)
-                bump(aggH, ts, "ALL", r.market_cap, r.volume_24h, r.last_updated)
+            bump_ts_with_carry(aggH, slots_hour, cat, sort_ts_rows(rowsH), carry_hour)
 
             rowsD = session.execute(
                 sel_daily,
-                [cid, start_day, end_day],
+                [cid, query_start_day, end_day],
                 timeout=REQUEST_TIMEOUT_SEC,
             )
-            for r in rowsD:
-                d = getattr(r, "date", None)
-                if d is None:
-                    continue
-                bump(aggD, d, cat, r.market_cap, r.volume_24h, r.last_updated)
-                bump(aggD, d, "ALL", r.market_cap, r.volume_24h, r.last_updated)
+            bump_day_with_carry(aggD, slots_day, cat, sort_day_rows(rowsD), carry_day)
 
         wrote10 = wroteH = wroteD = 0
 

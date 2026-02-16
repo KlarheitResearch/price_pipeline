@@ -229,5 +229,8 @@ jobs:
           PP_MCAP_10M_SLOTS: ${{ env.MCAP_10M_SLOTS_RESOLVED }}
           PP_MCAP_HOURS: ${{ env.MCAP_HOURS_RESOLVED }}
           PP_MCAP_DAYS: ${{ env.MCAP_DAYS_RESOLVED }}
+          PP_MCAP_10M_CARRY_HOURS: "8"
+          PP_MCAP_HOURLY_CARRY_HOURS: "12"
+          PP_MCAP_DAILY_CARRY_DAYS: "3"
           REQUEST_TIMEOUT_SEC: "45"
         run: python prices/prod_pipeline/HH_write_market_caps.py
