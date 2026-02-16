@@ -11,6 +11,10 @@ on:
         description: "Inclusive end rank"
         required: true
         default: "100"
+      coin_ids:
+        description: "Optional comma-separated CoinGecko IDs (intersected with rank window)"
+        required: false
+        default: ""
       from_utc:
         description: "UTC start (YYYY-MM-DD or ISO timestamp)"
         required: true
@@ -106,6 +110,9 @@ jobs:
             --to-utc "${{ github.event.inputs.to_utc }}" \
             --granularity "${{ github.event.inputs.granularity }}")
 
+          if [ -n "${{ github.event.inputs.coin_ids }}" ]; then
+            CMD+=(--coin-ids "${{ github.event.inputs.coin_ids }}")
+          fi
           if [ "${{ github.event.inputs.overwrite_existing }}" = "true" ]; then
             CMD+=(--overwrite-existing)
           fi

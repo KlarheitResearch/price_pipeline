@@ -208,6 +208,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Manual API repair for 10m/hourly datasets.")
     p.add_argument("--rank-start", type=int, required=True, help="Inclusive start rank (e.g. 1)")
     p.add_argument("--rank-end", type=int, required=True, help="Inclusive end rank (e.g. 100)")
+    p.add_argument(
+        "--coin-ids",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated CoinGecko ids. "
+            "If set, only matching ids are repaired (still constrained by rank window)."
+        ),
+    )
     p.add_argument("--from-utc", type=str, required=True, help="UTC start (YYYY-MM-DD or ISO timestamp)")
     p.add_argument("--to-utc", type=str, required=True, help="UTC end exclusive (YYYY-MM-DD or ISO timestamp)")
     p.add_argument("--granularity", choices=["10m", "hourly", "both"], default="both")
@@ -231,11 +240,15 @@ def main() -> None:
     do_10m = args.granularity in ("10m", "both")
     do_hourly = args.granularity in ("hourly", "both")
     dry_run = bool(args.dry_run)
+    coin_ids_filter = {
+        token.strip().lower() for token in str(args.coin_ids or "").split(",") if token.strip()
+    }
 
     print(
         f"[{now_str()}] Manual repair config: ranks={rank_start}-{rank_end}, "
         f"window={start_dt.isoformat()} -> {end_dt.isoformat()}, granularity={args.granularity}, "
-        f"overwrite={args.overwrite_existing}, dry_run={dry_run}, keys={len(KEY_POOL.keys)}, tier={API_TIER}"
+        f"overwrite={args.overwrite_existing}, dry_run={dry_run}, ids_filter={len(coin_ids_filter)}, "
+        f"keys={len(KEY_POOL.keys)}, tier={API_TIER}"
     )
     if do_10m and (end_dt - start_dt) > timedelta(days=7):
         print(f"[{now_str()}] WARN: 10m table is typically 7d-scoped; range exceeds 7 days.")
@@ -278,7 +291,23 @@ def main() -> None:
     rows = list(session.execute(sel_live, timeout=REQUEST_TIMEOUT))
     ranked = [r for r in rows if isinstance(getattr(r, "market_cap_rank", None), int) and r.market_cap_rank > 0]
     ranked.sort(key=lambda r: r.market_cap_rank)
-    selected = [r for r in ranked if rank_start <= int(r.market_cap_rank) <= rank_end]
+    selected = []
+    for row in ranked:
+        rank = int(row.market_cap_rank)
+        if rank < rank_start or rank > rank_end:
+            continue
+        coin_id = (getattr(row, "id", "") or "").strip().lower()
+        if coin_ids_filter and coin_id not in coin_ids_filter:
+            continue
+        selected.append(row)
+    if coin_ids_filter:
+        selected_ids = {(getattr(r, "id", "") or "").strip().lower() for r in selected}
+        missing_ids = sorted(coin_ids_filter - selected_ids)
+        if missing_ids:
+            print(
+                f"[{now_str()}] WARN: {len(missing_ids)} filtered ids are not in selected rank window: "
+                f"{', '.join(missing_ids[:25])}{' ...' if len(missing_ids) > 25 else ''}"
+            )
     print(f"[{now_str()}] Selected {len(selected)} coin(s) in rank window.")
 
     wrote_10m = 0

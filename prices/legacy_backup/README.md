@@ -10,7 +10,7 @@ This folder is now the active runtime basis for the low-API-cost mode.
 - Hourly candles: `DD_gck_create_hourly_from_10m.py` (from 10m, no CoinGecko).
 - Daily candles: `EE_gck_create_daily_from_10m.py` (from 10m, no CoinGecko).
 - Monthly candles: `EG_gck_update_monthly_from_daily.py` (from daily/live, no CoinGecko).
-- True daily close API enrichment: `EF_gck_close_daily_topn_api.py` for top 100 only (default), once daily.
+- True daily close API enrichment: `EF_gck_close_daily_topn_api.py` (default rank 1-100), once daily.
 - API-key handling for all CoinGecko callers is centralized in `cg_key_pool.py` (AA/BB/CC/DD rotation + cooldown/suspension).
 
 ## Defaults changed
@@ -26,7 +26,7 @@ This folder is now the active runtime basis for the low-API-cost mode.
 Active workflow set is intentionally small:
 
 - `gecko_legacy_core.yml`: main legacy cycle (AA + CC every 10m, optional DD/EE/EG by dispatch input).
-- `gecko_legacy_daily_api_close.yml`: top-100 true daily API close (`EF_gck_close_daily_topn_api.py`).
+- `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
 - `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
 
@@ -83,6 +83,7 @@ Original prod-era workflow files are archived (not active) at:
 ## Manual intraday repair
 
 Use `GM_gck_manual_repair_intraday.py` for on-demand 10m/hourly repairs by rank range and UTC time window.
+You can optionally narrow to explicit coin ids.
 
 Local example:
 
@@ -91,6 +92,7 @@ cd backend
 PYTHONPATH=. python prices/legacy_backup/GM_gck_manual_repair_intraday.py \
   --rank-start 1 \
   --rank-end 100 \
+  --coin-ids bitcoin,ethereum \
   --from-utc 2026-02-14T00:00:00Z \
   --to-utc 2026-02-15T00:00:00Z \
   --granularity both \
@@ -100,7 +102,7 @@ PYTHONPATH=. python prices/legacy_backup/GM_gck_manual_repair_intraday.py \
 GitHub Actions manual dispatch:
 
 - Workflow: `gecko-legacy-manual-repair` (`backend/.github/workflows/gecko_legacy_manual_repair.yml`).
-- Inputs: rank window, UTC range, granularity, overwrite mode, dry-run mode.
+- Inputs: rank window, optional coin ids, UTC range, granularity, overwrite mode, dry-run mode.
 
 ## Optional Cloudflare dispatch scripts
 

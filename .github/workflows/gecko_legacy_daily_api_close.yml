@@ -11,12 +11,32 @@ on:
         description: "Top N for true API daily close"
         required: false
         default: "100"
+      rank_start:
+        description: "Optional inclusive rank start (overrides TOP_N scope model)"
+        required: false
+        default: ""
+      rank_end:
+        description: "Optional inclusive rank end (defaults to TOP_N_API_DAILY when blank)"
+        required: false
+        default: ""
+      coin_ids:
+        description: "Optional comma-separated CoinGecko IDs (intersected with rank window)"
+        required: false
+        default: ""
       TOP_N_AGG_DAILY:
         description: "Top N used to rebuild daily mcap aggregates"
         required: false
         default: "1000"
+      TARGET_START_DAY_ISO:
+        description: "Optional start day YYYY-MM-DD (inclusive)"
+        required: false
+        default: ""
+      TARGET_END_DAY_ISO:
+        description: "Optional end day YYYY-MM-DD (inclusive)"
+        required: false
+        default: ""
       TARGET_DAY_ISO:
-        description: "Optional YYYY-MM-DD override (default: yesterday UTC)"
+        description: "Legacy single-day input (fallback only)"
         required: false
         default: ""
       VERBOSE_MODE:
@@ -41,6 +61,9 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+      RANK_START_RESOLVED: ${{ github.event.inputs.rank_start || '1' }}
+      RANK_END_RESOLVED: ${{ github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '100' }}
+      COIN_IDS_RESOLVED: ${{ github.event.inputs.coin_ids || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +96,11 @@ jobs:
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '100' }}
           TOP_N_AGG_DAILY: ${{ github.event.inputs.TOP_N_AGG_DAILY || '1000' }}
+          RANK_START: ${{ env.RANK_START_RESOLVED }}
+          RANK_END: ${{ env.RANK_END_RESOLVED }}
+          COIN_IDS: ${{ env.COIN_IDS_RESOLVED }}
+          TARGET_START_DAY_ISO: ${{ github.event.inputs.TARGET_START_DAY_ISO || '' }}
+          TARGET_END_DAY_ISO: ${{ github.event.inputs.TARGET_END_DAY_ISO || '' }}
           TARGET_DAY_ISO: ${{ github.event.inputs.TARGET_DAY_ISO || '' }}
           REBUILD_MCAP_DAILY: "1"
           REQUEST_TIMEOUT_SEC: "45"
@@ -81,4 +109,6 @@ jobs:
         run: |
           python prices/legacy_backup/pipeline_health_runner.py \
             --script-id EF_gck_close_daily_topn_api \
+            --rank-start "${{ env.RANK_START_RESOLVED }}" \
+            --rank-end "${{ env.RANK_END_RESOLVED }}" \
             -- python prices/legacy_backup/EF_gck_close_daily_topn_api.py

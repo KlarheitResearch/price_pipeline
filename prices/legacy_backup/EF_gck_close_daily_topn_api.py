@@ -2,15 +2,15 @@
 """
 EF_gck_close_daily_topn_api.py
 
-Finalize the previous UTC day (or TARGET_DAY_ISO) with true API-driven daily candles
-for top-ranked coins only (default: top 100).
+Finalize UTC day windows with true API-driven daily candles
+for top-ranked coins only (default rank window 1..100).
 
 Reads:
   - gecko_prices_live
 
 Writes:
   - gecko_candles_daily_contin
-  - optional: gecko_market_cap_daily_contin for the target day
+  - optional: gecko_market_cap_daily_contin for the target day(s)
 """
 
 import os
@@ -68,11 +68,42 @@ def equalish(a, b, eps: float = 1e-12) -> bool:
         return False
 
 
-def parse_day_utc() -> date:
-    target = (os.getenv("TARGET_DAY_ISO") or "").strip()
-    if target:
-        return datetime.strptime(target, "%Y-%m-%d").date()
-    return (now_utc() - timedelta(days=1)).date()
+def parse_iso_day(raw: str) -> date:
+    return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+
+
+def days_inclusive(start_day: date, end_day: date) -> list[date]:
+    out: list[date] = []
+    cur = start_day
+    while cur <= end_day:
+        out.append(cur)
+        cur += timedelta(days=1)
+    return out
+
+
+def parse_day_window_utc() -> list[date]:
+    start_raw = (os.getenv("TARGET_START_DAY_ISO") or "").strip()
+    end_raw = (os.getenv("TARGET_END_DAY_ISO") or "").strip()
+    target_raw = (os.getenv("TARGET_DAY_ISO") or "").strip()
+
+    if start_raw or end_raw:
+        start_day = parse_iso_day(start_raw or end_raw)
+        end_day = parse_iso_day(end_raw or start_raw)
+        if end_day < start_day:
+            raise SystemExit("Invalid day window. TARGET_END_DAY_ISO must be >= TARGET_START_DAY_ISO.")
+        max_days = parse_int_env("TARGET_MAX_DAYS", 120)
+        days = days_inclusive(start_day, end_day)
+        if max_days > 0 and len(days) > max_days:
+            raise SystemExit(
+                f"Day window too large ({len(days)} > {max_days}). "
+                f"Adjust TARGET_MAX_DAYS if you really need this."
+            )
+        return days
+
+    if target_raw:
+        return [parse_iso_day(target_raw)]
+
+    return [(now_utc() - timedelta(days=1)).date()]
 
 
 def day_bounds_utc(d: date) -> tuple[datetime, datetime]:
@@ -80,8 +111,29 @@ def day_bounds_utc(d: date) -> tuple[datetime, datetime]:
     return s, s + timedelta(days=1)
 
 
+def parse_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    if not text:
+        return default
+    try:
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def parse_coin_ids_env(name: str = "COIN_IDS") -> set[str]:
+    raw = os.getenv(name) or ""
+    return {token.strip().lower() for token in raw.split(",") if token.strip()}
+
+
 TOP_N = int(os.getenv("TOP_N_API_DAILY", "100"))
 TOP_N_AGG = int(os.getenv("TOP_N_AGG_DAILY", "1000"))
+RANK_START = parse_int_env("RANK_START", 1)
+RANK_END = parse_int_env("RANK_END", TOP_N)
+COIN_IDS_FILTER = parse_coin_ids_env("COIN_IDS")
 FETCH_SIZE = int(os.getenv("FETCH_SIZE", "500"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 RETRIES = int(os.getenv("RETRIES", "3"))
@@ -102,7 +154,8 @@ TABLE_DAILY = os.getenv("DAILY_TABLE", os.getenv("TABLE_DAILY", "gecko_candles_d
 TABLE_MCAP_DAILY = os.getenv("TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 
 print(
-    f"[{now_str()}] Config: top_n={TOP_N}, top_n_agg={TOP_N_AGG}, dry_run={DRY_RUN}, "
+    f"[{now_str()}] Config: top_n={TOP_N}, top_n_agg={TOP_N_AGG}, rank_start={RANK_START}, "
+    f"rank_end={RANK_END}, coin_ids_filter={len(COIN_IDS_FILTER)}, dry_run={DRY_RUN}, "
     f"rebuild_mcap_daily={REBUILD_MCAP_DAILY}, keys={len(KEY_POOL.keys)}, tier={API_TIER}"
 )
 
@@ -122,43 +175,51 @@ def http_get(path: str, params: dict | None = None) -> dict:
     return out
 
 
-def bucket_daily_payload(payload: dict, target_day: date) -> dict | None:
-    def keep_day(values):
-        out = []
+def bucket_daily_payload_map(payload: dict, target_days: set[date]) -> dict[date, dict]:
+    def keep_days(values):
+        out: dict[date, list[tuple[datetime, float]]] = {}
         for ms, val in values or []:
             ts = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
-            if ts.date() == target_day and val is not None:
-                out.append((ts, float(val)))
-        out.sort(key=lambda t: t[0])
+            d = ts.date()
+            if d in target_days and val is not None:
+                out.setdefault(d, []).append((ts, float(val)))
+        for points in out.values():
+            points.sort(key=lambda t: t[0])
         return out
 
-    prices = keep_day(payload.get("prices", []))
-    if not prices:
-        return None
+    price_map = keep_days(payload.get("prices", []))
+    mcap_map = keep_days(payload.get("market_caps", []))
+    vol_map = keep_days(payload.get("total_volumes", []))
 
-    mcaps = keep_day(payload.get("market_caps", []))
-    vols = keep_day(payload.get("total_volumes", []))
+    out: dict[date, dict] = {}
+    for day in sorted(target_days):
+        prices = price_map.get(day) or []
+        if not prices:
+            continue
+        mcaps = mcap_map.get(day) or []
+        vols = vol_map.get(day) or []
 
-    vals = [p for _, p in prices]
-    o = vals[0]
-    h = max(vals)
-    l = min(vals)
-    c = vals[-1]
-    last_ts = prices[-1][0]
-    mcap = mcaps[-1][1] if mcaps else None
-    vol = vols[-1][1] if vols else None
+        vals = [p for _, p in prices]
+        o = vals[0]
+        h = max(vals)
+        l = min(vals)
+        c = vals[-1]
+        last_ts = prices[-1][0]
+        mcap = mcaps[-1][1] if mcaps else None
+        vol = vols[-1][1] if vols else None
 
-    return {
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-        "price_usd": c,
-        "market_cap": mcap,
-        "volume_24h": vol,
-        "last_updated": last_ts,
-        "candle_source": "api_daily_final",
-    }
+        out[day] = {
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "price_usd": c,
+            "market_cap": mcap,
+            "volume_24h": vol,
+            "last_updated": last_ts,
+            "candle_source": "api_daily_final",
+        }
+    return out
 
 
 print(f"[{now_str()}] Connecting to Astra...")
@@ -289,21 +350,50 @@ def recompute_mcap_daily_for_day(target_day: date, ranked_rows: list) -> int:
 
 
 def main() -> None:
-    target_day = parse_day_utc()
-    day_start, day_end_excl = day_bounds_utc(target_day)
-    from_ts = int(day_start.timestamp())
-    to_ts = int(day_end_excl.timestamp())
+    if RANK_START < 1 or RANK_END < RANK_START:
+        raise SystemExit("Invalid rank window. Require RANK_START>=1 and RANK_END>=RANK_START.")
 
-    print(f"[{now_str()}] Target day: {target_day} ({day_start.isoformat()} -> {day_end_excl.isoformat()})")
+    target_days = parse_day_window_utc()
+    target_day_set = set(target_days)
+    range_start, _ = day_bounds_utc(target_days[0])
+    _, range_end_excl = day_bounds_utc(target_days[-1])
+    from_ts = int(range_start.timestamp())
+    to_ts = int(range_end_excl.timestamp())
+
+    print(
+        f"[{now_str()}] Target days: {target_days[0]} .. {target_days[-1]} (count={len(target_days)}) "
+        f"[inclusive]"
+    )
+    print(f"[{now_str()}] API window: {range_start.isoformat()} -> {range_end_excl.isoformat()} (exclusive)")
 
     live_rows = list(session.execute(SEL_LIVE, timeout=REQUEST_TIMEOUT))
     ranked = [r for r in live_rows if isinstance(getattr(r, "market_cap_rank", None), int) and r.market_cap_rank > 0]
     ranked.sort(key=lambda r: r.market_cap_rank)
 
-    top_for_daily = ranked[:TOP_N]
-    top_for_agg = ranked[:max(TOP_N, TOP_N_AGG)]
+    top_for_daily = [
+        row
+        for row in ranked
+        if RANK_START <= int(getattr(row, "market_cap_rank", 0)) <= RANK_END
+    ]
+    if COIN_IDS_FILTER:
+        top_for_daily = [
+            row for row in top_for_daily if (getattr(row, "id", "") or "").strip().lower() in COIN_IDS_FILTER
+        ]
+        selected_ids = {(getattr(r, "id", "") or "").strip().lower() for r in top_for_daily}
+        missing_ids = sorted(COIN_IDS_FILTER - selected_ids)
+        if missing_ids:
+            print(
+                f"[{now_str()}] WARN: {len(missing_ids)} filtered ids are not in selected rank window: "
+                f"{', '.join(missing_ids[:25])}{' ...' if len(missing_ids) > 25 else ''}"
+            )
 
-    print(f"[{now_str()}] Live ranked universe: {len(ranked)} | daily_close_scope={len(top_for_daily)}")
+    agg_cutoff = max(TOP_N_AGG, RANK_END)
+    top_for_agg = ranked[:agg_cutoff]
+
+    print(
+        f"[{now_str()}] Live ranked universe: {len(ranked)} | daily_close_scope={len(top_for_daily)} "
+        f"(rank[{RANK_START}-{RANK_END}])"
+    )
 
     wrote = 0
     skipped_equal = 0
@@ -331,43 +421,44 @@ def main() -> None:
                     "precision": "full",
                 },
             )
-            candle = bucket_daily_payload(payload, target_day)
-            if not candle:
-                skipped_empty += 1
-                print(f"[{now_str()}]    skip: no points for target day")
-                continue
+            candles_by_day = bucket_daily_payload_map(payload, target_day_set)
+            for target_day in target_days:
+                candle = candles_by_day.get(target_day)
+                if not candle:
+                    skipped_empty += 1
+                    continue
 
-            existing = session.execute(SEL_DAILY_ONE, [coin_id, target_day], timeout=REQUEST_TIMEOUT).one()
-            if row_equal(existing, candle):
-                skipped_equal += 1
-                continue
+                existing = session.execute(SEL_DAILY_ONE, [coin_id, target_day], timeout=REQUEST_TIMEOUT).one()
+                if row_equal(existing, candle):
+                    skipped_equal += 1
+                    continue
 
-            if not DRY_RUN:
-                batch.add(
-                    INS_DAILY,
-                    [
-                        coin_id,
-                        target_day,
-                        symbol,
-                        name,
-                        float(candle["open"]),
-                        float(candle["high"]),
-                        float(candle["low"]),
-                        float(candle["close"]),
-                        float(candle["price_usd"]),
-                        fnum(candle["market_cap"]),
-                        fnum(candle["volume_24h"]),
-                        int(rank) if rank is not None else None,
-                        circ,
-                        totl,
-                        candle["candle_source"],
-                        to_cassandra_ts(candle["last_updated"]),
-                    ],
-                )
-            wrote += 1
-            if (wrote % WRITE_BATCH_SIZE) == 0 and (not DRY_RUN):
-                session.execute(batch)
-                batch.clear()
+                if not DRY_RUN:
+                    batch.add(
+                        INS_DAILY,
+                        [
+                            coin_id,
+                            target_day,
+                            symbol,
+                            name,
+                            float(candle["open"]),
+                            float(candle["high"]),
+                            float(candle["low"]),
+                            float(candle["close"]),
+                            float(candle["price_usd"]),
+                            fnum(candle["market_cap"]),
+                            fnum(candle["volume_24h"]),
+                            int(rank) if rank is not None else None,
+                            circ,
+                            totl,
+                            candle["candle_source"],
+                            to_cassandra_ts(candle["last_updated"]),
+                        ],
+                    )
+                wrote += 1
+                if (wrote % WRITE_BATCH_SIZE) == 0 and (not DRY_RUN):
+                    session.execute(batch)
+                    batch.clear()
         except Exception as e:
             errors += 1
             print(f"[{now_str()}]    error: {e}")
@@ -380,11 +471,15 @@ def main() -> None:
 
     mcap_rows = 0
     if REBUILD_MCAP_DAILY:
-        print(f"[{now_str()}] Recomputing daily market-cap aggregates for {target_day} from top {len(top_for_agg)} rows...")
-        mcap_rows = recompute_mcap_daily_for_day(target_day, top_for_agg)
+        for target_day in target_days:
+            print(
+                f"[{now_str()}] Recomputing daily market-cap aggregates for {target_day} "
+                f"from top {len(top_for_agg)} rows..."
+            )
+            mcap_rows += recompute_mcap_daily_for_day(target_day, top_for_agg)
 
     print(
-        f"[{now_str()}] Done. wrote_daily={wrote}, skipped_equal={skipped_equal}, "
+        f"[{now_str()}] Done. days={len(target_days)}, wrote_daily={wrote}, skipped_equal={skipped_equal}, "
         f"skipped_empty={skipped_empty}, errors={errors}, mcap_rows={mcap_rows}, dry_run={DRY_RUN}"
     )
 
