@@ -139,6 +139,36 @@ Current trigger strategy:
 Cloudflare setup is documented here:
 - `backend/prices/prod_pipeline/CLOUDFLARE_WORKERS.md`
 
+Cloudflare dispatch matrix (current):
+- `prod-core-5m` (`*/5 * * * *`)
+  - always: `gecko_prod_live_tier1_5m.yml` (`run_live=true`)
+  - every 10m: `gecko_prod_tier1_10m.yml` with:
+    - `run_live=false`
+    - `run_10m=true`
+    - `run_derivatives=true`
+    - `run_hourly=false`
+    - `run_daily=false`
+    - `run_monthly=false`
+  - hourly at `:05`: `gecko_prod_tier2_hourly.yml` with:
+    - `run_live=true`
+    - `run_10m=true`
+    - `run_mcap=false`
+    - `run_derivatives=true`
+    - `run_hourly=true`
+    - `run_daily=true`
+    - `run_monthly=false`
+  - daily at `00:50 UTC`: `gecko_prod_tier2_hourly.yml` mcap-only:
+    - `run_live=false`, `run_10m=false`, `run_mcap=true`,
+      `run_derivatives=false`, `run_hourly=false`, `run_daily=false`, `run_monthly=false`
+  - every 4h at `:15`: `gecko_prod_tier3_4h.yml`
+- `prod-repair-hourly` (`37 * * * *`): repair tier1 every hour; repair tier2 every 4h
+- `prod-repair-daily` (`55 2 * * *`): repair tier3 daily
+- `prod-bootstrap-daily` (`23 3 * * *`): bootstrap entrants daily
+
+Note:
+- `5m` and `10m` workflows run at the same wall-clock minute on `:00/:10/:20/...` by design.
+- This is expected; the `10m` dispatch above skips `run_live`, so overlap is limited and intentional.
+
 ## Data Consistency Behavior
 
 ### Live projection across open candles
@@ -194,7 +224,9 @@ Selection and recovery behavior:
 - retries hop keys
 - per-key pacing and RPM guard
 - temporary 429 suspension with cooldown
-- credit-exhaustion detection and long suspension (optionally until next UTC month)
+- credit-exhaustion detection and key suspension for the current run/process
+- optional month-end suspension remains available via `CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END=1`
+  (default is `0`, so key rotation between runs works as expected)
 - auth-failure suspension
 - when all keys are temporarily rate-limited, client can wait and retry instead of hard-failing (`CG_WAIT_ON_ALL_KEYS_SUSPENDED=1`)
 

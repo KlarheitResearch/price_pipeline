@@ -225,7 +225,7 @@ def main() -> None:
         )
         sel_hourly_one = session.prepare(
             f"""
-            SELECT candle_source, point_count
+            SELECT candle_source, point_count, circulating_supply, total_supply
             FROM {TABLE_HOURLY}
             WHERE id=? AND ts=? LIMIT 1
             """
@@ -329,6 +329,8 @@ def main() -> None:
                         item["effective"] = SimpleNamespace(
                             candle_source="10m_final",
                             point_count=int(candle["point_count"]),
+                            circulating_supply=candle["circulating_supply"],
+                            total_supply=candle["total_supply"],
                         )
 
             api_targets = [item for item in closed_hours if _needs_api_finalize(item["effective"])]
@@ -359,6 +361,8 @@ def main() -> None:
                 last_price_ts = prices[-1][0]
                 mcap, _ = last_value_in_window(api_finalize_data.get("market_caps", []) or [], hour_start, hour_end)
                 vol, _ = last_value_in_window(api_finalize_data.get("total_volumes", []) or [], hour_start, hour_end)
+                carry_circ = _f(getattr(item["effective"], "circulating_supply", None))
+                carry_total = _f(getattr(item["effective"], "total_supply", None))
 
                 session.execute(
                     ins_hourly,
@@ -367,7 +371,7 @@ def main() -> None:
                         open_price, high, low, close, close,
                         mcap, vol,
                         coin.market_cap_rank if isinstance(coin.market_cap_rank, int) else None,
-                        None, None,
+                        carry_circ, carry_total,
                         "cg_hourly_final", len(price_values), to_cassandra_ts(last_price_ts),
                     ],
                     timeout=REQUEST_TIMEOUT_SEC,

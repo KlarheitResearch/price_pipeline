@@ -8,7 +8,7 @@ import pathlib
 import subprocess
 from collections import deque
 from bisect import bisect_left, bisect_right
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from cassandra.query import SimpleStatement
@@ -180,6 +180,31 @@ def _slot_idx_10m(ts) -> int:
     return ts.hour * 6 + (ts.minute // 10)
 
 
+def _as_py_date(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "date"):
+        try:
+            d = value.date()
+            if isinstance(d, date):
+                return d
+        except Exception:
+            pass
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        try:
+            return date(int(value.year), int(value.month), int(value.day))
+        except Exception:
+            pass
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
 def _bit_is_set(bitmap: bytes, slot_idx: int) -> bool:
     if slot_idx < 0:
         return False
@@ -211,7 +236,7 @@ def _coverage_marks_window_clean(session, sel_cov_10m, coin_id: str, expected_by
     )
     by_day = {}
     for r in rows:
-        d = getattr(r, "day", None)
+        d = _as_py_date(getattr(r, "day", None))
         bm = getattr(r, "bitmap", None)
         if d is None or bm is None:
             continue

@@ -14,6 +14,7 @@ Why 4 workers:
   - always: `gecko_prod_live_tier1_5m.yml`
   - if `minute % 10 == 0`: `gecko_prod_tier1_10m.yml`
   - if `minute == 5`: `gecko_prod_tier2_hourly.yml`
+  - if `hour == 0 && minute == 50`: `gecko_prod_tier2_hourly.yml` (`run_mcap` only)
   - if `minute == 15 && hour % 4 == 0`: `gecko_prod_tier3_4h.yml`
 
 2. `prod-repair-hourly`
@@ -31,6 +32,10 @@ Why 4 workers:
 - Cron: `23 3 * * *`
 - Dispatch:
   - `gecko_prod_bootstrap_new_entrants_1y.yml`
+
+Expected overlap:
+- `prod-core-5m` dispatches both `5m` and `10m` workflows on `:00/:10/:20/...`.
+- This is intentional. The `10m` dispatch should keep `run_live=false` to avoid duplicate AA live snapshots.
 
 ## Required Worker Vars/Secrets (all 4 workers)
 
@@ -95,8 +100,8 @@ async function run(event, env) {
         run_live: "false",
         run_10m: "true",
         run_derivatives: "true",
-        run_hourly: "true",
-        run_daily: "true",
+        run_hourly: "false",
+        run_daily: "false",
         run_monthly: "false",
         VERBOSE_MODE: "0",
       },
@@ -109,11 +114,28 @@ async function run(event, env) {
       inputs: {
         run_live: "true",
         run_10m: "true",
-        run_mcap: "true",
+        run_mcap: "false",
         run_derivatives: "true",
         run_hourly: "true",
         run_daily: "true",
-        run_monthly: "true",
+        run_monthly: "false",
+        VERBOSE_MODE: "0",
+      },
+    });
+  }
+
+  // Daily mcap-only recompute
+  if (minute === 50 && hour === 0) {
+    jobs.push({
+      workflow: "gecko_prod_tier2_hourly.yml",
+      inputs: {
+        run_live: "false",
+        run_10m: "false",
+        run_mcap: "true",
+        run_derivatives: "false",
+        run_hourly: "false",
+        run_daily: "false",
+        run_monthly: "false",
         VERBOSE_MODE: "0",
       },
     });

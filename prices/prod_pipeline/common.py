@@ -216,17 +216,17 @@ def select_coins_from_live_rows(rows: list[Any]) -> list[Any]:
     return out
 
 
-TABLE_LIVE = os.getenv("PP_TABLE_LIVE", "pp_prices_live")
-TABLE_LIVE_RANKED = os.getenv("PP_TABLE_LIVE_RANKED", "pp_prices_live_ranked")
-TABLE_ROLLING = os.getenv("PP_TABLE_ROLLING", "pp_prices_live_rolling")
-TABLE_10M = os.getenv("PP_TABLE_10M", "pp_prices_10m_7d")
-TABLE_HOURLY = os.getenv("PP_TABLE_HOURLY", "pp_candles_hourly_30d")
-TABLE_DAILY = os.getenv("PP_TABLE_DAILY", "pp_candles_daily_contin")
-TABLE_MONTHLY = os.getenv("PP_TABLE_MONTHLY", "pp_candles_monthly")
-TABLE_MCAP_LIVE = os.getenv("PP_TABLE_MCAP_LIVE", "pp_market_cap_live")
-TABLE_MCAP_10M = os.getenv("PP_TABLE_MCAP_10M", "pp_market_cap_10m_7d")
-TABLE_MCAP_HOURLY = os.getenv("PP_TABLE_MCAP_HOURLY", "pp_market_cap_hourly_30d")
-TABLE_MCAP_DAILY = os.getenv("PP_TABLE_MCAP_DAILY", "pp_market_cap_daily_contin")
+TABLE_LIVE = os.getenv("PP_TABLE_LIVE", "gecko_prices_live")
+TABLE_LIVE_RANKED = os.getenv("PP_TABLE_LIVE_RANKED", "gecko_prices_live_ranked")
+TABLE_ROLLING = os.getenv("PP_TABLE_ROLLING", "gecko_prices_live_rolling")
+TABLE_10M = os.getenv("PP_TABLE_10M", "gecko_prices_10m_7d")
+TABLE_HOURLY = os.getenv("PP_TABLE_HOURLY", "gecko_candles_hourly_30d")
+TABLE_DAILY = os.getenv("PP_TABLE_DAILY", "gecko_candles_daily_contin")
+TABLE_MONTHLY = os.getenv("PP_TABLE_MONTHLY", "gecko_candles_monthly")
+TABLE_MCAP_LIVE = os.getenv("PP_TABLE_MCAP_LIVE", "gecko_market_cap_live")
+TABLE_MCAP_10M = os.getenv("PP_TABLE_MCAP_10M", "gecko_market_cap_10m_7d")
+TABLE_MCAP_HOURLY = os.getenv("PP_TABLE_MCAP_HOURLY", "gecko_market_cap_hourly_30d")
+TABLE_MCAP_DAILY = os.getenv("PP_TABLE_MCAP_DAILY", "gecko_market_cap_daily_contin")
 TABLE_PIPELINE_RUNS = os.getenv("PP_TABLE_PIPELINE_RUNS", "pp_pipeline_runs")
 TABLE_PIPELINE_LATEST = os.getenv("PP_TABLE_PIPELINE_LATEST", "pp_pipeline_latest")
 PIPELINE_HEALTH_ENABLED = _env_flag("PP_HEALTH_ENABLED", True)
@@ -475,7 +475,7 @@ CG_AUTH_FAILURE_COOLDOWN_S = float(os.getenv("CG_AUTH_FAILURE_COOLDOWN_S", "2160
 CG_WAIT_ON_ALL_KEYS_SUSPENDED = os.getenv("CG_WAIT_ON_ALL_KEYS_SUSPENDED", "1") == "1"
 CG_ALL_KEYS_MAX_WAIT_S = float(os.getenv("CG_ALL_KEYS_MAX_WAIT_S", "120"))
 CG_ALL_KEYS_WAIT_PAD_S = float(os.getenv("CG_ALL_KEYS_WAIT_PAD_S", "0.25"))
-CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END = os.getenv("CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END", "1") == "1"
+CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END = os.getenv("CG_CREDIT_EXHAUSTED_UNTIL_MONTH_END", "0") == "1"
 
 
 def _parse_csv_env(raw: Optional[str]) -> list[str]:
@@ -512,11 +512,24 @@ def _is_credit_exhaustion_text(text: str) -> bool:
     t = (text or "").lower()
     if not t:
         return False
+
+    def _calls_cap_reached() -> bool:
+        has_calls_cap = any(tok in t for tok in ("calls limit", "call limit", "api call limit", "request limit"))
+        if not has_calls_cap:
+            return False
+        has_reached = any(tok in t for tok in ("you've reached", "you have reached", "limit reached", "exceeded"))
+        has_plan_hint = any(tok in t for tok in ("developer dashboard", "subscribe", "pricing", "plan"))
+        return has_reached or has_plan_hint
+
+    calls_cap = _calls_cap_reached()
     positive = ("monthly", "credit", "quota", "usage cap", "plan limit", "billing", "upgrade plan")
-    if not any(tok in t for tok in positive):
+    if not calls_cap and not any(tok in t for tok in positive):
         return False
-    # Distinguish short-term rate limits from monthly plan exhaustion.
-    if ("per minute" in t or "minute rate" in t or "too many requests" in t) and ("monthly" not in t and "credit" not in t):
+
+    # Distinguish short-term per-minute throttling from quota exhaustion.
+    per_minute_like = ("per minute" in t or "minute rate" in t or "too many requests" in t)
+    has_quota_hint = ("monthly" in t or "credit" in t or "quota" in t or "usage cap" in t)
+    if per_minute_like and not (calls_cap or has_quota_hint):
         return False
     return True
 
@@ -525,8 +538,22 @@ def _is_monthly_credit_exhaustion_text(text: str) -> bool:
     t = (text or "").lower()
     if not t:
         return False
-    has_credit_like = any(tok in t for tok in ("credit", "credits", "quota", "allowance", "usage cap", "plan limit"))
+
+    has_call_cap_like = (
+        ("calls limit" in t or "call limit" in t)
+        and ("you've reached" in t or "you have reached" in t or "developer dashboard" in t or "pricing" in t)
+    )
+    has_credit_like = has_call_cap_like or any(
+        tok in t for tok in ("credit", "credits", "quota", "allowance", "usage cap", "plan limit")
+    )
     has_month_like = any(tok in t for tok in ("monthly", "month", "billing cycle", "next month", "resets"))
+
+    # CoinGecko demo-plan exhaustion often reports "You've reached 10,000 calls limit"
+    # without explicitly saying "month". Treat this as monthly quota exhaustion.
+    if has_call_cap_like and not has_month_like:
+        if "10,000" in t or "10000" in t or API_TIER == "demo":
+            has_month_like = True
+
     return has_credit_like and has_month_like
 
 
@@ -571,21 +598,27 @@ def _load_api_keys() -> list[str]:
             if k and k not in disabled and k not in keys:
                 keys.append(k)
 
-    preferred = [
+    # Explicit pool first.
+    preferred_pool = [
         "COINGECKO_API_KEY_AA",
         "COINGECKO_API_KEY_BB",
         "COINGECKO_API_KEY_CC",
         "COINGECKO_API_KEY_DD",
-        "COINGECKO_API_KEY",
     ]
     extras = sorted(
         n for n in os.environ.keys()
-        if n.startswith("COINGECKO_API_KEY_") and n not in preferred
+        if n.startswith("COINGECKO_API_KEY_") and n not in preferred_pool
     )
-    for env_name in preferred + extras:
+    for env_name in preferred_pool + extras:
         k = (os.getenv(env_name) or "").strip()
         if k and k not in disabled and k not in keys:
             keys.append(k)
+
+    # Generic key is fallback-only to avoid accidental stale key usage when AA/BB/CC/DD are configured.
+    fallback_single = (os.getenv("COINGECKO_API_KEY") or "").strip()
+    if fallback_single and fallback_single not in disabled and fallback_single not in keys:
+        if not keys:
+            keys.append(fallback_single)
 
     return keys
 
