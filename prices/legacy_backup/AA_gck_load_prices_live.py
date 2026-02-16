@@ -25,7 +25,7 @@ from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()
 
 # ───────────────────────── Config ─────────────────────────
-TOP_N        = int(os.getenv("TOP_N", "300"))
+TOP_N        = int(os.getenv("TOP_N", "1000"))
 RETRIES      = int(os.getenv("RETRIES", "3"))
 BACKOFF_MIN  = int(os.getenv("BACKOFF_MIN", "5"))
 MAX_BACKOFF  = int(os.getenv("MAX_BACKOFF_MIN", "30"))

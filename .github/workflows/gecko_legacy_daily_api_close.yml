@@ -1,0 +1,80 @@
+name: gecko-legacy-daily-api-close
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_daily_api_close:
+        description: "Run EF_gck_close_daily_topn_api.py"
+        required: false
+        default: "true"
+      TOP_N_API_DAILY:
+        description: "Top N for true API daily close"
+        required: false
+        default: "100"
+      TOP_N_AGG_DAILY:
+        description: "Top N used to rebuild daily mcap aggregates"
+        required: false
+        default: "1000"
+      TARGET_DAY_ISO:
+        description: "Optional YYYY-MM-DD override (default: yesterday UTC)"
+        required: false
+        default: ""
+      VERBOSE_MODE:
+        description: "Verbose (0/1)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gecko-legacy-daily-api-close-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: ${{ github.event.inputs.run_daily_api_close != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+      VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export PYTHONPATH (repo root)
+        run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
+
+      - name: Astra bundle
+        run: |
+          echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+          test -s secure-connect.zip
+
+      - name: API daily close
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
+          COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }},${{ secrets.COINGECKO_API_KEY }}"
+          TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '100' }}
+          TOP_N_AGG_DAILY: ${{ github.event.inputs.TOP_N_AGG_DAILY || '1000' }}
+          TARGET_DAY_ISO: ${{ github.event.inputs.TARGET_DAY_ISO || '' }}
+          REBUILD_MCAP_DAILY: "1"
+          REQUEST_TIMEOUT_SEC: "45"
+          BACKOFF_SEC: "3"
+          VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
+        run: python prices/legacy_backup/EF_gck_close_daily_topn_api.py

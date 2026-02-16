@@ -10,7 +10,7 @@ from astra_connect.connect import get_session, AstraConfig
 AstraConfig.from_env()  # loads .env if present, otherwise uses process env
 
 # Config
-TOP_N               = int(os.getenv("TOP_N", "300"))
+TOP_N               = int(os.getenv("TOP_N", "1000"))
 REQUEST_TIMEOUT     = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 
@@ -464,6 +464,13 @@ def main():
             candle_source = "10m_final"
 
             existing = existing or get_existing(d)
+            existing_source = (getattr(existing, "candle_source", None) or "").strip().lower() if existing else ""
+            if existing and existing_source in {"api_daily_final", "daily_api"}:
+                aggregate_existing(d)
+                unchanged += 1
+                if VERBOSE_MODE:
+                    print(f"[{now_str()}]    {c.symbol} {d} has authoritative api source ({existing_source}) -> keep existing")
+                continue
             if existing and getattr(existing, "candle_source", None) == "10m_final":
                 same = all([
                     equalish(o, getattr(existing, "open", None)),
@@ -544,8 +551,15 @@ def main():
     
                 last_upd = bucket["last_updated"] or (today_end_excl - timedelta(seconds=1))
                 candle_source = "10m_partial"
-    
+
                 existing = existing or get_existing(d)
+                existing_source = (getattr(existing, "candle_source", None) or "").strip().lower() if existing else ""
+                if existing and existing_source in {"api_daily_final", "daily_api"}:
+                    aggregate_existing(d)
+                    unchanged += 1
+                    if VERBOSE_MODE:
+                        print(f"[{now_str()}]    {c.symbol} {d} has authoritative api source ({existing_source}) -> keep existing")
+                    continue
                 if existing and getattr(existing, "candle_source", None) == "10m_partial":
                     same = all([
                         equalish(o, getattr(existing, "open", None)),
