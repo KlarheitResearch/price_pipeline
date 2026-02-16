@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 from bisect import bisect_left, bisect_right
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Optional
 
 from cassandra.query import SimpleStatement
 
@@ -257,9 +258,9 @@ def main() -> None:
             heal_window_end = slots[-1][1] if heal_slots else None
             api_loaded = False
             api_failed = False
-            price_series = None
-            mcap_series = None
-            vol_series = None
+            price_series: Optional[SeriesAccessor] = None
+            mcap_series: Optional[SeriesAccessor] = None
+            vol_series: Optional[SeriesAccessor] = None
 
             for slot_start, slot_end in slots:
                 in_slot_rows = list(
@@ -280,7 +281,11 @@ def main() -> None:
                 existing_row = existing_by_slot.get(slot_start)
 
                 if in_slot_rows:
-                    price_points = [_f(r.price_usd) for r in in_slot_rows if r.price_usd is not None]
+                    price_points: list[float] = []
+                    for live_row in in_slot_rows:
+                        price_val = _f(getattr(live_row, "price_usd", None))
+                        if price_val is not None:
+                            price_points.append(price_val)
                     if not price_points:
                         skipped += 1
                         continue
@@ -288,8 +293,8 @@ def main() -> None:
                     first_price = price_points[0]
                     close = price_points[-1]
                     open_price = prev_close if prev_close is not None else first_price
-                    high = max([open_price] + price_points)
-                    low = min([open_price] + price_points)
+                    high = max([open_price, *price_points])
+                    low = min([open_price, *price_points])
                     last_row = in_slot_rows[-1]
                     last_updated = to_utc(last_row.last_updated) or (slot_end - timedelta(seconds=1))
 
@@ -345,33 +350,36 @@ def main() -> None:
                     and _needs_heal_api(existing_row)
                 )
                 if slot_needs_api:
+                    if heal_window_start is None or heal_window_end is None:
+                        continue
+                    api_window_start = heal_window_start - timedelta(hours=1)
                     heal_target_slots += 1
                     if not api_loaded and not api_failed:
                         try:
                             data = cg_market_chart_range(
                                 coin.id,
-                                heal_window_start - timedelta(hours=1),
+                                api_window_start,
                                 heal_window_end,
                                 vs_currency="usd",
                             )
                             price_series = SeriesAccessor(
                                 extract_series_in_window(
                                     data.get("prices", []) or [],
-                                    heal_window_start - timedelta(hours=1),
+                                    api_window_start,
                                     heal_window_end,
                                 )
                             )
                             mcap_series = SeriesAccessor(
                                 extract_series_in_window(
                                     data.get("market_caps", []) or [],
-                                    heal_window_start - timedelta(hours=1),
+                                    api_window_start,
                                     heal_window_end,
                                 )
                             )
                             vol_series = SeriesAccessor(
                                 extract_series_in_window(
                                     data.get("total_volumes", []) or [],
-                                    heal_window_start - timedelta(hours=1),
+                                    api_window_start,
                                     heal_window_end,
                                 )
                             )

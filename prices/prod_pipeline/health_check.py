@@ -6,8 +6,9 @@ import os
 import pathlib
 import sys
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
+from cassandra.cluster import Cluster, Session
 _BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.append(str(_BACKEND_ROOT))
@@ -37,9 +38,9 @@ def to_utc(ts) -> datetime | None:
     return ts.astimezone(UTC)
 
 
-def connect_astra():
+def connect_astra() -> tuple[Session, Cluster]:
     AstraConfig.from_env()
-    return get_session(return_cluster=True)
+    return cast(tuple[Session, Cluster], get_session(return_cluster=True))
 
 
 def _fmt_ts(ts) -> str:

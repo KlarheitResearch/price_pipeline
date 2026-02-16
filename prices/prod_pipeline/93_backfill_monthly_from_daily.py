@@ -63,7 +63,7 @@ def _to_date(value):
 
 
 def _aggregate_month(rows):
-    ordered = sorted(rows, key=lambda r: getattr(r, "date", None))
+    ordered = sorted(rows, key=lambda r: _to_date(getattr(r, "date", None)) or date.min)
     if not ordered:
         return None
     out = {

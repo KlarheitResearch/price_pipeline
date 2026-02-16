@@ -13,9 +13,10 @@ import socket
 import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Optional, cast, overload
 
 import requests
+from cassandra.cluster import Cluster, Session
 
 _BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(_BACKEND_ROOT) not in sys.path:
@@ -104,6 +105,16 @@ def drain_async(pending: deque) -> None:
 def vprint(msg: str) -> None:
     if is_verbose():
         print(f"[{now_str()}] {msg}")
+
+
+@overload
+def to_utc(ts: None) -> None:
+    ...
+
+
+@overload
+def to_utc(ts: datetime) -> datetime:
+    ...
 
 
 def to_utc(ts: Optional[datetime]) -> Optional[datetime]:
@@ -292,9 +303,9 @@ def category_for(coin_id: Optional[str], symbol: Optional[str]) -> str:
     return "Other"
 
 
-def connect_astra():
+def connect_astra() -> tuple[Session, Cluster]:
     AstraConfig.from_env()
-    return get_session(return_cluster=True)
+    return cast(tuple[Session, Cluster], get_session(return_cluster=True))
 
 
 class PipelineHealthTracker:

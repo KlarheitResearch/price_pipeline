@@ -6,6 +6,7 @@ from collections import deque
 from collections import defaultdict
 from datetime import datetime, timezone
 from datetime import timedelta
+from typing import Optional, TypedDict
 
 from cassandra.query import SimpleStatement
 
@@ -34,6 +35,16 @@ ASTRA_MAX_IN_FLIGHT = int(os.getenv("PP_ASTRA_MAX_IN_FLIGHT", "64"))
 ENFORCE_UNIQUE_LIVE_RANKS = os.getenv("PP_ENFORCE_UNIQUE_LIVE_RANKS", "1") == "1"
 DUPLICATE_RANK_ACTION = (os.getenv("PP_DUPLICATE_RANK_ACTION", "demote") or "demote").strip().lower()
 PRUNE_UNRANKED_STALE_HOURS = int(os.getenv("PP_PRUNE_UNRANKED_STALE_HOURS", "72"))
+
+
+class CategoryTotals(TypedDict):
+    market_cap: float
+    volume_24h: float
+    last_updated: Optional[datetime]
+
+
+def _new_totals_bucket() -> CategoryTotals:
+    return {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": None}
 
 
 def _f(x):
@@ -197,6 +208,8 @@ def main() -> None:
                 cid = getattr(r, "id", None)
                 print(f"[{now_str()}] ranked write {idx}/{len(ranked_rows)} -> {cid}")
             hb.maybe(extra=f"ranked={idx}/{len(ranked_rows)}")
+            lu_raw = getattr(r, "last_updated", None)
+            lu = to_utc(lu_raw) if lu_raw is not None else None
             enqueue_async(
                 session,
                 ranked_pending,
@@ -213,7 +226,7 @@ def main() -> None:
                     getattr(r, "volume_24h", None),
                     getattr(r, "circulating_supply", None),
                     getattr(r, "total_supply", None),
-                    to_cassandra_ts(to_utc(getattr(r, "last_updated", None))) if getattr(r, "last_updated", None) is not None else None,
+                    to_cassandra_ts(lu) if lu is not None else None,
                 ],
                 timeout=REQUEST_TIMEOUT_SEC,
                 max_in_flight=ASTRA_MAX_IN_FLIGHT,
@@ -222,14 +235,15 @@ def main() -> None:
         drain_async(ranked_pending)
         hb.maybe(extra="ranked_flush=done", force=True)
 
-        totals = defaultdict(lambda: {"market_cap": 0.0, "volume_24h": 0.0, "last_updated": None})
+        totals: defaultdict[str, CategoryTotals] = defaultdict(_new_totals_bucket)
         for r in ranked_rows:
             cat = (getattr(r, "category", None) or "Other").strip() or "Other"
             lu = to_utc(getattr(r, "last_updated", None))
             for c in (cat, "ALL"):
                 totals[c]["market_cap"] += _f(getattr(r, "market_cap", None))
                 totals[c]["volume_24h"] += _f(getattr(r, "volume_24h", None))
-                if lu is not None and (totals[c]["last_updated"] is None or lu > totals[c]["last_updated"]):
+                existing_lu = totals[c]["last_updated"]
+                if lu is not None and (existing_lu is None or lu > existing_lu):
                     totals[c]["last_updated"] = lu
 
         ranked_cats = sorted(
@@ -265,9 +279,9 @@ def main() -> None:
                 [
                     cat,
                     to_cassandra_ts(lu) if lu is not None else None,
-                    float(vals["market_cap"]),
+                    vals["market_cap"],
                     cat_ranks.get(cat),
-                    float(vals["volume_24h"]),
+                    vals["volume_24h"],
                 ],
                 timeout=REQUEST_TIMEOUT_SEC,
                 max_in_flight=ASTRA_MAX_IN_FLIGHT,

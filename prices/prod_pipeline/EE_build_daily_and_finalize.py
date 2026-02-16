@@ -131,8 +131,8 @@ def build_day_from_10m(rows, day_start, day_end):
     if close is None:
         close = open_price
 
-    highs = []
-    lows = []
+    highs: list[float] = []
+    lows: list[float] = []
     points = 0
     last_updated = None
     for r in ordered:
@@ -156,12 +156,13 @@ def build_day_from_10m(rows, day_start, day_end):
         if lu is not None and (last_updated is None or lu > last_updated):
             last_updated = lu
 
+    if open_price is None or close is None:
+        return None
     if not highs or not lows:
         highs = [open_price, close]
         lows = [open_price, close]
-
-    high = max([open_price] + highs + [close])
-    low = min([open_price] + lows + [close])
+    high = max([open_price, *highs, close])
+    low = min([open_price, *lows, close])
     if last_updated is None:
         last_updated = day_end - timedelta(seconds=1)
 

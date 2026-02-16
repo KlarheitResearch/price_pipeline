@@ -5,6 +5,7 @@ import math
 import os
 from collections import deque
 from datetime import datetime, timedelta
+from typing import Any, cast
 
 from common import (
     Heartbeat,
@@ -90,11 +91,21 @@ def _merge_partial(existing_row, live_price: float, live_last_updated: datetime)
     return open_price, high, low, close, point_count, last_updated
 
 
+def _as_market_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if isinstance(item, dict):
+            rows.append(cast(dict[str, Any], item))
+    return rows
+
+
 def main() -> None:
     hb = Heartbeat("AA_load_live_selected")
     rank_window = get_rank_window()
-    rows = []
-    by_id = {}
+    rows: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
 
     if rank_window:
         start_rank, end_rank = rank_window
@@ -120,7 +131,7 @@ def main() -> None:
                 },
                 hint=f"coins_markets_page_{page}",
             )
-            page_rows = data or []
+            page_rows = _as_market_rows(data)
             for row in page_rows:
                 rank = row.get("market_cap_rank")
                 try:
@@ -132,7 +143,7 @@ def main() -> None:
                 if start_rank <= rank <= end_rank:
                     cid = row.get("id")
                     if cid:
-                        by_id[cid] = row
+                        by_id[str(cid)] = row
             page_idx = page - start_page + 1
             print(f"[{now_str()}] page={page_idx}/{pages} (api_page={page}) collected={len(by_id)}")
 
@@ -156,8 +167,12 @@ def main() -> None:
             },
             hint="coins_markets_selected",
         )
-        rows = data or []
-        by_id = {row.get("id"): row for row in rows if row.get("id")}
+        rows = _as_market_rows(data)
+        by_id = {}
+        for row in rows:
+            cid = str(row.get("id") or "").strip()
+            if cid:
+                by_id[cid] = row
 
     print(f"[{now_str()}] CoinGecko returned {len(rows)} scoped row(s).")
 
