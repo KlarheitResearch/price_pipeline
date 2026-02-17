@@ -157,7 +157,7 @@ jobs:
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
           AGG_MIN_COINS: "200"
           AGG_CARRY_FORWARD: "1"
-        run: python prices/legacy_backup/DD_gck_create_hourly_from_10m.py
+        run: python prices/prod_pipeline/DD_gck_create_hourly_from_10m.py
 
       - name: 04 Update/close daily from 10m
         if: env.RUN_04 == 'true'
@@ -179,7 +179,7 @@ jobs:
           WRITE_MCAP_DAILY: "1"
           AGG_MIN_COINS: "200"
           AGG_CARRY_FORWARD: "1"
-        run: python prices/legacy_backup/EE_gck_create_daily_from_10m.py
+        run: python prices/prod_pipeline/EE_gck_create_daily_from_10m.py
 
       - name: 05 Update monthly from daily/live
         if: env.RUN_05 == 'true'
@@ -197,6 +197,6 @@ jobs:
           FETCH_SIZE: "500"
           PROGRESS_EVERY: "20"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/EG_gck_update_monthly_from_daily.py
+        run: python prices/prod_pipeline/EG_gck_update_monthly_from_daily.py
 
 

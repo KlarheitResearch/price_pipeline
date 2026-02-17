@@ -122,7 +122,7 @@ jobs:
           AVAIL_RUN_INTRADAY: "1"
           IDS_SOURCE: "live"
         run: |
-          python prices/legacy_backup/FF_gck_coin_data_availability.py
+          python prices/prod_pipeline/FF_gck_coin_data_availability.py
 
       # ????????????????????????????????? Availability: daily coverage (ranges + summary) ?????????????????????????????????
       - name: Update daily coverage (ranges + summary)
@@ -134,7 +134,7 @@ jobs:
           AVAIL_RUN_INTRADAY: "0"
           IDS_SOURCE: "daily"
         run: |
-          python prices/legacy_backup/FF_gck_coin_data_availability.py
+          python prices/prod_pipeline/FF_gck_coin_data_availability.py
 
       # -- wait 60 seconds so coverage writes are visible
       - name: Wait for coverage writes to become visible
@@ -174,7 +174,7 @@ jobs:
 
           # Let script defaults handle universe (top_N + all daily IDs)
         run: |
-          python prices/legacy_backup/GG_gck_dq_repair_timeseries.py
+          python prices/prod_pipeline/GG_gck_dq_repair_timeseries.py
 
       # ????????????????????????????????? (2) FULL: API-based repair for top 20 (hourly + daily, no 10m) ?????????????????????????????????
       - name: Full repair (top 20, CoinGecko, hourly+daily only)
@@ -220,6 +220,6 @@ jobs:
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER || 'pro' }}
         run: |
-          python prices/legacy_backup/GG_gck_dq_repair_timeseries.py
+          python prices/prod_pipeline/GG_gck_dq_repair_timeseries.py
 
 

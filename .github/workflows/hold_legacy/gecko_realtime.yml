@@ -163,7 +163,7 @@ jobs:
           GECKO_MCAP_BUCKET: "categories"
 
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/AA_gck_load_prices_live.py
+        run: python prices/prod_pipeline/AA_gck_load_prices_live.py
 
       - name: 02 Append 10m from live_rolling
         if: env.RUN_02 == 'true'
@@ -184,7 +184,7 @@ jobs:
           AGG_MIN_COINS: "200"
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/CC_gck_append_10m_from_live.py
+        run: python prices/prod_pipeline/CC_gck_append_10m_from_live.py
 
       - name: 02b Gapfill missing 10m slots (last 12h)
         if: env.RUN_GAPFILL == 'true' && env.RUN_02 == 'true'
@@ -211,6 +211,6 @@ jobs:
           AGG_CARRY_FORWARD: "1"
 
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
-        run: python prices/legacy_backup/CC_gck_append_10m_from_live.py
+        run: python prices/prod_pipeline/CC_gck_append_10m_from_live.py
 
 

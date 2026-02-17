@@ -69,9 +69,9 @@ jobs:
           WIN_10M_DAYS: "7"
           WIN_HOURLY_DAYS: "30"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id FF_gck_coin_data_availability \
-            -- python prices/legacy_backup/FF_gck_coin_data_availability.py
+            -- python prices/prod_pipeline/FF_gck_coin_data_availability.py
 
       - name: 10m gap audit (top 1000)
         if: env.RUN_AUDIT == 'true'
@@ -83,6 +83,6 @@ jobs:
           DQ_WINDOW_10M_DAYS: "7"
           DQ_REQUEST_TIMEOUT_SEC: "30"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id audit_10m_gaps \
-            -- python prices/legacy_backup/audit_10m_gaps.py
+            -- python prices/prod_pipeline/audit_10m_gaps.py

@@ -35,6 +35,14 @@ on:
         description: "Hourly: only prev_final + curr_partial (0/1)"
         required: false
         default: "1"
+      DAILY_CURRENT_ONLY:
+        description: "Daily: only update current partial day from 10m/live (0/1)"
+        required: false
+        default: "1"
+      MONTHLY_CURRENT_ONLY:
+        description: "Monthly: only update current partial month (0/1)"
+        required: false
+        default: "1"
       VERBOSE_MODE:
         description: "Verbose (0/1)"
         required: false
@@ -67,6 +75,8 @@ jobs:
       TOP_N_RESOLVED: ${{ github.event.inputs.TOP_N || '1000' }}
       RANK_TOP_N_RESOLVED: ${{ github.event.inputs.RANK_TOP_N || github.event.inputs.TOP_N || '1000' }}
       CURRENT_ONLY_RESOLVED: ${{ github.event.inputs.CURRENT_ONLY || '1' }}
+      DAILY_CURRENT_ONLY_RESOLVED: ${{ github.event.inputs.DAILY_CURRENT_ONLY || '1' }}
+      MONTHLY_CURRENT_ONLY_RESOLVED: ${{ github.event.inputs.MONTHLY_CURRENT_ONLY || '1' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
     steps:
@@ -115,9 +125,9 @@ jobs:
           RANK_BUCKET: "all"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id AA_gck_load_prices_live \
-            -- python prices/legacy_backup/AA_gck_load_prices_live.py
+            -- python prices/prod_pipeline/AA_gck_load_prices_live.py
 
       - name: CC append 10m from live
         if: env.RUN_10M == 'true'
@@ -144,9 +154,9 @@ jobs:
           LOG_INSERT_LINES: "0"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id CC_gck_append_10m_from_live \
-            -- python prices/legacy_backup/CC_gck_append_10m_from_live.py
+            -- python prices/prod_pipeline/CC_gck_append_10m_from_live.py
 
       - name: DD update hourly from 10m
         if: env.RUN_HOURLY == 'true'
@@ -168,13 +178,13 @@ jobs:
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id DD_gck_create_hourly_from_10m \
-            -- python prices/legacy_backup/DD_gck_create_hourly_from_10m.py
+            -- python prices/prod_pipeline/DD_gck_create_hourly_from_10m.py
 
       - name: EE update daily from 10m
         if: env.RUN_DAILY_10M == 'true'
-        timeout-minutes: 12
+        timeout-minutes: 25
         env:
           ASTRA_BUNDLE_PATH: secure-connect.zip
           ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
@@ -186,14 +196,15 @@ jobs:
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "20"
+          CURRENT_ONLY: "${{ env.DAILY_CURRENT_ONLY_RESOLVED }}"
           WRITE_MCAP_DAILY: "1"
           AGG_MIN_COINS: "700"
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id EE_gck_create_daily_from_10m \
-            -- python prices/legacy_backup/EE_gck_create_daily_from_10m.py
+            -- python prices/prod_pipeline/EE_gck_create_daily_from_10m.py
 
       - name: EG update monthly from daily
         if: env.RUN_MONTHLY == 'true'
@@ -207,8 +218,9 @@ jobs:
           REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
+          CURRENT_ONLY: "${{ env.MONTHLY_CURRENT_ONLY_RESOLVED }}"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id EG_gck_update_monthly_from_daily \
-            -- python prices/legacy_backup/EG_gck_update_monthly_from_daily.py
+            -- python prices/prod_pipeline/EG_gck_update_monthly_from_daily.py

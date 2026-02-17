@@ -9,7 +9,7 @@ def _log(msg):
 
 
 def _set_prod_legacy_table_defaults() -> None:
-    # Route prod_pipeline scripts to legacy gecko_* tables unless explicitly overridden.
+    # Route potential_future scripts to legacy gecko_* tables unless explicitly overridden.
     os.environ.setdefault("PP_FORCE_TEST_MODE", "0")
     os.environ.setdefault("PP_TEST_MODE_UNTIL_UTC", "")
     os.environ.setdefault("PP_TABLE_LIVE", "gecko_prices_live")
@@ -42,9 +42,9 @@ def realtime_handler(event, context):
     _log("realtime_handler start")
     os.environ.setdefault("ASTRA_BUNDLE_PATH", "/var/task/secure-connect.zip")
     _set_prod_legacy_table_defaults()
-    _run("prices.prod_pipeline.AA_load_live_selected")
-    _run("prices.prod_pipeline.BB_refresh_live_derivatives")
-    _run("prices.prod_pipeline.CC_build_10m_intraday")
+    _run("prices.potential_future.AA_load_live_selected")
+    _run("prices.potential_future.BB_refresh_live_derivatives")
+    _run("prices.potential_future.CC_build_10m_intraday")
     _log("realtime_handler done")
     return {"ok": True}
 
@@ -54,7 +54,7 @@ def candles_handler(event, context):
     _log("candles_handler start")
     os.environ.setdefault("ASTRA_BUNDLE_PATH", "/var/task/secure-connect.zip")
     _set_prod_legacy_table_defaults()
-    _run("prices.prod_pipeline.DD_build_hourly_and_finalize")
-    _run("prices.prod_pipeline.EE_build_daily_and_finalize")
+    _run("prices.potential_future.DD_build_hourly_and_finalize")
+    _run("prices.potential_future.EE_build_daily_and_finalize")
     _log("candles_handler done")
     return {"ok": True}

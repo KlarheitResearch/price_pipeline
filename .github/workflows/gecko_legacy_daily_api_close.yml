@@ -10,7 +10,7 @@ on:
       TOP_N_API_DAILY:
         description: "Top N for true API daily close"
         required: false
-        default: "100"
+        default: "300"
       rank_start:
         description: "Optional inclusive rank start (overrides TOP_N scope model)"
         required: false
@@ -62,7 +62,7 @@ jobs:
       PYTHONUTF8: "1"
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       RANK_START_RESOLVED: ${{ github.event.inputs.rank_start || '1' }}
-      RANK_END_RESOLVED: ${{ github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '100' }}
+      RANK_END_RESOLVED: ${{ github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '300' }}
       COIN_IDS_RESOLVED: ${{ github.event.inputs.coin_ids || '' }}
     steps:
       - uses: actions/checkout@v4
@@ -94,7 +94,7 @@ jobs:
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
           COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
-          TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '100' }}
+          TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '300' }}
           TOP_N_AGG_DAILY: ${{ github.event.inputs.TOP_N_AGG_DAILY || '1000' }}
           RANK_START: ${{ env.RANK_START_RESOLVED }}
           RANK_END: ${{ env.RANK_END_RESOLVED }}
@@ -107,8 +107,8 @@ jobs:
           CG_BACKOFF_BASE_S: "3"
           VERBOSE_MODE: ${{ env.VERBOSE_RESOLVED }}
         run: |
-          python prices/legacy_backup/pipeline_health_runner.py \
+          python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id EF_gck_close_daily_topn_api \
             --rank-start "${{ env.RANK_START_RESOLVED }}" \
             --rank-end "${{ env.RANK_END_RESOLVED }}" \
-            -- python prices/legacy_backup/EF_gck_close_daily_topn_api.py
+            -- python prices/prod_pipeline/EF_gck_close_daily_topn_api.py
