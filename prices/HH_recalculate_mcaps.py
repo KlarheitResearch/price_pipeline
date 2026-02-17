@@ -23,7 +23,10 @@ from typing import Dict
 _here = pathlib.Path(__file__).resolve()
 _candidates = [_here.parents[2], _here.parents[1]]
 for cand in _candidates:
-    if (cand / "prices" / "category_mapping.csv").exists():
+    if (
+        (cand / "prices" / "category_mapping.csv").exists()
+        or (cand / "prices" / "prod_pipeline" / "category_mapping.csv").exists()
+    ):
         _REPO_ROOT = cand
         break
 else:
@@ -68,7 +71,18 @@ if AGG_MIN_COINS < 0:
 # Safety: avoid clearing tables by default (keeps frontend stable during rebuilds)
 TRUNCATE_TARGETS = os.getenv("TRUNCATE_TARGETS", "0") == "1"
 
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
+_DEFAULT_CATEGORY_FILE_PROD = rel("prices", "prod_pipeline", "category_mapping.csv")
+_DEFAULT_CATEGORY_FILE_SHARED = rel("prices", "category_mapping.csv")
+
+def resolve_category_file() -> str:
+    env_path = (os.getenv("CATEGORY_FILE") or "").strip()
+    if env_path:
+        return env_path
+    if _DEFAULT_CATEGORY_FILE_PROD.exists():
+        return str(_DEFAULT_CATEGORY_FILE_PROD)
+    return str(_DEFAULT_CATEGORY_FILE_SHARED)
+
+CATEGORY_FILE = resolve_category_file()
 
 NOW_UTC       = datetime.now(timezone.utc)
 WIN_10M_START = NOW_UTC - timedelta(days=7)

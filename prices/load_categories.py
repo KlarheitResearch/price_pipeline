@@ -32,7 +32,18 @@ BUNDLE       = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
 ASTRA_TOKEN  = os.getenv("ASTRA_TOKEN")
 KEYSPACE     = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
 
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(rel("prices", "category_mapping.csv")))
+_DEFAULT_CATEGORY_FILE_PROD = rel("prices", "prod_pipeline", "category_mapping.csv")
+_DEFAULT_CATEGORY_FILE_SHARED = rel("prices", "category_mapping.csv")
+
+def resolve_category_file() -> str:
+    env_path = (os.getenv("CATEGORY_FILE") or "").strip()
+    if env_path:
+        return env_path
+    if _DEFAULT_CATEGORY_FILE_PROD.exists():
+        return str(_DEFAULT_CATEGORY_FILE_PROD)
+    return str(_DEFAULT_CATEGORY_FILE_SHARED)
+
+CATEGORY_FILE = resolve_category_file()
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
