@@ -89,12 +89,15 @@ def autodetect_and_load(path: str) -> list[dict]:
         for delim in [",", ";", "\t", "|"]:
             f.seek(0)
             dr = csv.DictReader(f, delimiter=delim)
-            headers = [h.strip().lower() for h in (dr.fieldnames or [])]
+            fieldnames = dr.fieldnames
+            if not fieldnames:
+                continue
+            headers = [h.strip().lower() for h in fieldnames]
             if "id" in headers and "category" in headers:
                 used_delim = delim
-                id_key = dr.fieldnames[headers.index("id")]
-                sym_key = dr.fieldnames[headers.index("symbol")] if "symbol" in headers else None
-                cat_key = dr.fieldnames[headers.index("category")]
+                id_key = fieldnames[headers.index("id")]
+                sym_key = fieldnames[headers.index("symbol")] if "symbol" in headers else None
+                cat_key = fieldnames[headers.index("category")]
                 for row in dr:
                     total_rows += 1
                     idv = (row.get(id_key) or "").strip()
