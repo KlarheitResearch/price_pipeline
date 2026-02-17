@@ -51,10 +51,20 @@ RANK_TOP_N            = int(os.getenv("RANK_TOP_N", str(TOP_N)))
 # Use a large positive int for ASC clustering; switch to -1 if you use DESC.
 SENTINEL_UNRANKED = 2_000_000_000  # Cassandra int is 32-bit; this fits.
 
-# categories (ID/Symbol -> Category; default path resolved relative to this file)
+# categories (ID/Symbol -> Category)
 _THIS_DIR = pathlib.Path(__file__).resolve().parent
-_DEFAULT_CATEGORY_FILE = _THIS_DIR / "category_mapping.csv"
-CATEGORY_FILE = os.getenv("CATEGORY_FILE", str(_DEFAULT_CATEGORY_FILE))
+_DEFAULT_CATEGORY_FILE_LOCAL = _THIS_DIR / "category_mapping.csv"
+_DEFAULT_CATEGORY_FILE_SHARED = _THIS_DIR.parent / "category_mapping.csv"
+
+def resolve_category_file() -> str:
+    env_path = (os.getenv("CATEGORY_FILE") or "").strip()
+    if env_path:
+        return env_path
+    if _DEFAULT_CATEGORY_FILE_LOCAL.exists():
+        return str(_DEFAULT_CATEGORY_FILE_LOCAL)
+    return str(_DEFAULT_CATEGORY_FILE_SHARED)
+
+CATEGORY_FILE = resolve_category_file()
 
 # CoinGecko
 API_TIER   = (os.getenv("COINGECKO_API_TIER") or "demo").strip().lower()  # "demo" | "pro"
