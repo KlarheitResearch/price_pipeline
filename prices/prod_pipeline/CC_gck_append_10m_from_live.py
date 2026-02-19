@@ -55,6 +55,35 @@ AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", str(_DEFAULT_AGG_MIN)))
 if AGG_MIN_COINS < 0:
     AGG_MIN_COINS = 0
 AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
+
+# Aggregate quality gates
+AGG_REQUIRED_IDS = [x.strip().lower() for x in os.getenv("AGG_REQUIRED_IDS", "bitcoin,ethereum").split(",") if x.strip()]
+AGG_ENFORCE_REQUIRED_IDS = os.getenv("AGG_ENFORCE_REQUIRED_IDS", "1") == "1"
+AGG_MIN_PREV_COVERAGE_RATIO = float(os.getenv("AGG_MIN_PREV_COVERAGE_RATIO", "0.90"))
+if AGG_MIN_PREV_COVERAGE_RATIO < 0.0:
+    AGG_MIN_PREV_COVERAGE_RATIO = 0.0
+if AGG_MIN_PREV_COVERAGE_RATIO > 2.0:
+    AGG_MIN_PREV_COVERAGE_RATIO = 2.0
+
+# Quarantine guard for one-slot spikes/dips
+AGG_QUARANTINE_ENABLED = os.getenv("AGG_QUARANTINE_ENABLED", "1") == "1"
+AGG_QUARANTINE_ON_REQUIRED_MISS = os.getenv("AGG_QUARANTINE_ON_REQUIRED_MISS", "1") == "1"
+AGG_QUARANTINE_ON_LOW_COVERAGE = os.getenv("AGG_QUARANTINE_ON_LOW_COVERAGE", "1") == "1"
+AGG_QUARANTINE_ON_VSHAPE = os.getenv("AGG_QUARANTINE_ON_VSHAPE", "1") == "1"
+AGG_VSHAPE_DROP_PCT = float(os.getenv("AGG_VSHAPE_DROP_PCT", "0.07"))
+if AGG_VSHAPE_DROP_PCT < 0.0:
+    AGG_VSHAPE_DROP_PCT = 0.0
+AGG_VSHAPE_MIN_ABS_USD = float(os.getenv("AGG_VSHAPE_MIN_ABS_USD", "50000000000"))
+if AGG_VSHAPE_MIN_ABS_USD < 0.0:
+    AGG_VSHAPE_MIN_ABS_USD = 0.0
+
+# Slot quality metadata (optional persistence)
+TABLE_MCAP_10M_QUALITY = os.getenv("TABLE_MCAP_10M_QUALITY", "gecko_market_cap_10m_quality")
+WRITE_SLOT_QUALITY = os.getenv("WRITE_SLOT_QUALITY", "1") == "1"
+QUALITY_TTL_SEC = int(os.getenv("QUALITY_TTL_SEC", str(14 * 24 * 3600)))
+if QUALITY_TTL_SEC < 0:
+    QUALITY_TTL_SEC = 0
+
 VERBOSE_MODE = os.getenv("VERBOSE_MODE", "0") == "1"
 PROGRESS_EVERY = max(1, int(os.getenv("PROGRESS_EVERY", "100")))
 APPEND_SKIP_EXISTING = os.getenv("APPEND_SKIP_EXISTING", "1") == "1"
@@ -65,6 +94,8 @@ COIN_WORKERS = max(1, int(os.getenv("COIN_WORKERS", "8")))
 WRITE_CONCURRENCY = max(1, int(os.getenv("WRITE_CONCURRENCY", "16")))
 
 # Optional post-run aggregate rebuild (recompute from stored 10m rows).
+# NOTE: append mode with APPEND_SKIP_EXISTING=1 and APPEND_AGG_FROM_EXISTING=0
+# can produce partial slot_totals unless we rebuild from persisted rows.
 REBUILD_AGG_AFTER_GAPFILL = os.getenv("REBUILD_AGG_AFTER_GAPFILL", "0") == "1"
 REBUILD_AGG_AFTER_APPEND = os.getenv("REBUILD_AGG_AFTER_APPEND", "0") == "1"
 
@@ -152,6 +183,12 @@ from cassandra.query import SimpleStatement
 session_keyspace = (session.keyspace or "").strip()
 KEYSPACE = ((os.getenv("ASTRA_KEYSPACE") or session_keyspace).strip() or session_keyspace or "default_keyspace")
 
+def fq_table(table_name: str) -> str:
+    t = (table_name or "").strip()
+    if "." in t:
+        return t
+    return f"{KEYSPACE}.{t}"
+
 SEL_COINS = SimpleStatement(
     f"SELECT id, symbol, name, market_cap_rank, category FROM {TABLE_LATEST}",
     fetch_size=FETCH_SIZE
@@ -231,6 +268,47 @@ INS_MCAP_10M_UPSERT = session.prepare(
     VALUES (?, ?, ?, ?, ?, ?)
     """
 )
+
+INS_SLOT_QUALITY_PS = None
+if WRITE_SLOT_QUALITY:
+    quality_table_fq = fq_table(TABLE_MCAP_10M_QUALITY)
+    try:
+        session.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quality_table_fq} (
+              day date,
+              ts timestamp,
+              run_mode text,
+              source text,
+              note text,
+              coin_count int,
+              required_ids_ok boolean,
+              missing_required_ids text,
+              raw_all double,
+              written_all double,
+              prev_all double,
+              coverage_ratio double,
+              drop_pct double,
+              is_quarantined boolean,
+              is_carried boolean,
+              last_updated timestamp,
+              PRIMARY KEY ((day), ts)
+            ) WITH CLUSTERING ORDER BY (ts DESC)
+            """,
+            timeout=REQUEST_TIMEOUT,
+        )
+        ttl_clause = f" USING TTL {QUALITY_TTL_SEC}" if QUALITY_TTL_SEC > 0 else ""
+        INS_SLOT_QUALITY_PS = session.prepare(
+            f"""
+            INSERT INTO {quality_table_fq}
+              (day, ts, run_mode, source, note, coin_count, required_ids_ok, missing_required_ids,
+               raw_all, written_all, prev_all, coverage_ratio, drop_pct, is_quarantined, is_carried, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?){ttl_clause}
+            """
+        )
+    except Exception as e:
+        INS_SLOT_QUALITY_PS = None
+        print(f"[{now_str()}] [mcap-10m][WARN] slot quality table unavailable: {e}")
 
 INS_LOCK_IF_NOT_EXISTS_PS = None
 if GAPFILL_ENABLED and GAPFILL_LOCK_ENABLED:
@@ -581,6 +659,46 @@ def main():
     # categories encountered in this run (for carry-forward)
     categories_seen: set[str] = set()
     carry_forward_slots: set[datetime] = set()
+    quarantined_slots: set[datetime] = set()
+    slot_decisions: Dict[datetime, Dict[str, Any]] = {}
+    required_id_set = set(AGG_REQUIRED_IDS)
+
+    def all_mcap_for_slot(catmap: Dict[str, Dict[str, Any]]) -> float:
+        all_row = catmap.get("ALL")
+        if not all_row:
+            return 0.0
+        return float(all_row.get("market_cap") or 0.0)
+
+    def required_ids_status(slot_start: datetime) -> Tuple[bool, List[str]]:
+        if not required_id_set:
+            return True, []
+        missing: List[str] = []
+        for coin_id in sorted(required_id_set):
+            try:
+                row = session.execute(
+                    SEL_10M_ONE_PS,
+                    [coin_id, slot_start],
+                    timeout=REQUEST_TIMEOUT,
+                ).one()
+            except Exception as e:
+                print(f"[{now_str()}] [mcap-10m][WARN] required id check failed {coin_id} @ {slot_start}: {e}")
+                row = None
+            if not row:
+                missing.append(coin_id)
+        return len(missing) == 0, missing
+
+    def build_carry_catmap(slot_start: datetime) -> Dict[str, Dict[str, Any]]:
+        carry_catmap: Dict[str, Dict[str, Any]] = {}
+        for category in sorted(categories_seen.union({"ALL"})):
+            prev = read_prev_mcap(category, slot_start)
+            if prev:
+                carry_catmap[category] = {
+                    "market_cap": prev["market_cap"],
+                    "volume_24h": prev["volume_24h"],
+                    "last_updated": prev["last_updated"],
+                    "market_cap_rank": prev.get("market_cap_rank"),
+                }
+        return carry_catmap
 
     def bump_slot_total(slot_start: datetime, category: str, mcap_value: float, vol_value: float, last_upd: datetime) -> None:
         catmap = slot_totals.setdefault(slot_start, {})
@@ -836,10 +954,24 @@ def main():
     while pending_writes:
         drain_one_write()
 
-    # Optional aggregate rebuild from stored rows (max stability)
+    # Safety: in append mode, skipping existing rows while not aggregating from existing
+    # means slot_totals only contains rows inserted in this run. Rebuild from table rows
+    # so category aggregates always reflect persisted slot contents.
+    auto_rebuild_append_for_consistency = (
+        run_mode == "append"
+        and APPEND_SKIP_EXISTING
+        and not APPEND_AGG_FROM_EXISTING
+    )
+    if auto_rebuild_append_for_consistency and not REBUILD_AGG_AFTER_APPEND:
+        print(
+            f"[{now_str()}] [mcap-10m] auto-enabling append aggregate rebuild "
+            f"(APPEND_SKIP_EXISTING=1, APPEND_AGG_FROM_EXISTING=0)"
+        )
+
+    # Optional/safety aggregate rebuild from stored rows (max stability)
     if (
         (run_mode == "gapfill" and REBUILD_AGG_AFTER_GAPFILL)
-        or (run_mode == "append" and REBUILD_AGG_AFTER_APPEND)
+        or (run_mode == "append" and (REBUILD_AGG_AFTER_APPEND or auto_rebuild_append_for_consistency))
     ):
         target_slots = [s for (s, _e) in slots]
         if target_slots:
@@ -853,38 +985,146 @@ def main():
             slot_coin_counts = rebuilt_counts
             print(f"[{now_str()}] [rebuild-agg] done: slots={len(slot_totals)}")
 
-    # Carry-forward for low-coverage slots (avoid partial totals)
-    if AGG_CARRY_FORWARD and AGG_MIN_COINS:
-        for slot_start, count in list(slot_coin_counts.items()):
-            if count >= AGG_MIN_COINS:
+    # Normalize ALL buckets before quality checks.
+    for slot_start in list(slot_totals.keys()):
+        slot_totals[slot_start] = ensure_all_bucket(slot_totals[slot_start])
+
+    # Detect one-slot V-shape anomalies across this run's slot window.
+    vshape_slots: set[datetime] = set()
+    sorted_present_slots = sorted(slot_totals.keys())
+    if len(sorted_present_slots) >= 3:
+        all_map = {s: all_mcap_for_slot(slot_totals[s]) for s in sorted_present_slots}
+        for i in range(1, len(sorted_present_slots) - 1):
+            prev_ts = sorted_present_slots[i - 1]
+            curr_ts = sorted_present_slots[i]
+            next_ts = sorted_present_slots[i + 1]
+            prev_all = all_map.get(prev_ts, 0.0)
+            curr_all = all_map.get(curr_ts, 0.0)
+            next_all = all_map.get(next_ts, 0.0)
+            if prev_all <= 0.0 or next_all <= 0.0:
                 continue
-            carry_catmap: Dict[str, Dict[str, Any]] = {}
-            for category in sorted(categories_seen.union({"ALL"})):
-                prev = read_prev_mcap(category, slot_start)
-                if prev:
-                    carry_catmap[category] = {
-                        "market_cap": prev["market_cap"],
-                        "volume_24h": prev["volume_24h"],
-                        "last_updated": prev["last_updated"],
-                        "market_cap_rank": prev.get("market_cap_rank"),
-                    }
-            if "ALL" not in carry_catmap:
-                continue
-            slot_totals[slot_start] = carry_catmap
-            carry_forward_slots.add(slot_start)
+            drop_abs = max(0.0, prev_all - curr_all)
+            rebound_abs = max(0.0, next_all - curr_all)
+            drop_pct = (drop_abs / prev_all) if prev_all > 0 else 0.0
+            rebound_pct = (rebound_abs / next_all) if next_all > 0 else 0.0
+            if (
+                drop_pct >= AGG_VSHAPE_DROP_PCT
+                and rebound_pct >= AGG_VSHAPE_DROP_PCT
+                and drop_abs >= AGG_VSHAPE_MIN_ABS_USD
+                and rebound_abs >= AGG_VSHAPE_MIN_ABS_USD
+            ):
+                vshape_slots.add(curr_ts)
+                print(
+                    f"[{now_str()}] [mcap-10m][vshape] slot={curr_ts} "
+                    f"drop={drop_abs:,.0f} ({drop_pct:.2%}) rebound={rebound_abs:,.0f} ({rebound_pct:.2%})"
+                )
+
+    # Decide write/carry/quarantine action per slot with quality metadata.
+    for slot_start in sorted(slot_totals.keys()):
+        coin_count = int(slot_coin_counts.get(slot_start, 0))
+        catmap = slot_totals[slot_start]
+        raw_all = all_mcap_for_slot(catmap)
+
+        prev_all_row = read_prev_mcap("ALL", slot_start)
+        prev_all = float(prev_all_row["market_cap"]) if prev_all_row is not None else None
+        coverage_ratio = (raw_all / prev_all) if (prev_all is not None and prev_all > 0.0) else None
+        drop_pct = ((prev_all - raw_all) / prev_all) if (prev_all is not None and prev_all > 0.0 and raw_all < prev_all) else 0.0
+
+        required_ok, missing_required_ids = required_ids_status(slot_start)
+        missing_required_txt = ",".join(missing_required_ids) if missing_required_ids else None
+
+        low_coin_count = bool(AGG_MIN_COINS and coin_count < AGG_MIN_COINS)
+        low_coverage = bool(
+            coverage_ratio is not None
+            and AGG_MIN_PREV_COVERAGE_RATIO > 0.0
+            and coverage_ratio < AGG_MIN_PREV_COVERAGE_RATIO
+        )
+        has_vshape = slot_start in vshape_slots
+
+        notes: List[str] = []
+        if low_coin_count:
+            notes.append(f"low_coin_count:{coin_count}<{AGG_MIN_COINS}")
+        if AGG_ENFORCE_REQUIRED_IDS and not required_ok:
+            notes.append(f"missing_required:{missing_required_txt}")
+        if low_coverage:
+            notes.append(f"low_coverage:{coverage_ratio:.4f}<{AGG_MIN_PREV_COVERAGE_RATIO:.4f}")
+        if has_vshape:
+            notes.append("vshape_anomaly")
+
+        action = "write"
+        source = "direct"
+        is_quarantined = False
+        is_carried = False
+        written_all = raw_all
+
+        quarantine_reasons: List[str] = []
+        if AGG_QUARANTINE_ENABLED:
+            if AGG_QUARANTINE_ON_REQUIRED_MISS and AGG_ENFORCE_REQUIRED_IDS and not required_ok:
+                quarantine_reasons.append("missing_required")
+            if AGG_QUARANTINE_ON_LOW_COVERAGE and low_coverage:
+                quarantine_reasons.append("low_coverage")
+            if AGG_QUARANTINE_ON_VSHAPE and has_vshape:
+                quarantine_reasons.append("vshape")
+
+        if quarantine_reasons:
+            is_quarantined = True
+            carry_catmap = build_carry_catmap(slot_start)
+            if "ALL" in carry_catmap:
+                slot_totals[slot_start] = carry_catmap
+                carry_forward_slots.add(slot_start)
+                quarantined_slots.add(slot_start)
+                source = "quarantine_prev"
+                is_carried = True
+                written_all = all_mcap_for_slot(carry_catmap)
+                notes.append(f"applied:quarantine_prev({'+'.join(quarantine_reasons)})")
+            else:
+                action = "skip"
+                source = "quarantine_skip"
+                notes.append(f"applied:quarantine_skip_no_prev({'+'.join(quarantine_reasons)})")
+        elif low_coin_count:
+            if AGG_CARRY_FORWARD:
+                carry_catmap = build_carry_catmap(slot_start)
+                if "ALL" in carry_catmap:
+                    slot_totals[slot_start] = carry_catmap
+                    carry_forward_slots.add(slot_start)
+                    source = "carry_low_coin_count"
+                    is_carried = True
+                    written_all = all_mcap_for_slot(carry_catmap)
+                    notes.append("applied:carry_prev_low_coin_count")
+                else:
+                    action = "skip"
+                    source = "skip_low_coin_count_no_prev"
+                    notes.append("applied:skip_low_coin_count_no_prev")
+            else:
+                action = "skip"
+                source = "skip_low_coin_count"
+                notes.append("applied:skip_low_coin_count")
+
+        slot_decisions[slot_start] = {
+            "action": action,
+            "source": source,
+            "note": ";".join(notes) if notes else None,
+            "coin_count": coin_count,
+            "required_ok": bool(required_ok or not AGG_ENFORCE_REQUIRED_IDS),
+            "missing_required_ids": missing_required_txt,
+            "raw_all": raw_all,
+            "written_all": written_all,
+            "prev_all": prev_all,
+            "coverage_ratio": coverage_ratio,
+            "drop_pct": drop_pct,
+            "is_quarantined": is_quarantined,
+            "is_carried": is_carried,
+        }
 
     # Write category aggregates (with ranks)
     if slot_totals and ((run_mode != "gapfill") or GAPFILL_WRITE_AGG):
         print(f"[{now_str()}] [mcap-10m] writing aggregates for {len(slot_totals)} slots into {TABLE_MCAP_OUT}")
         agg_written = 0
         for slot_start in sorted(slot_totals.keys()):
-            if AGG_MIN_COINS:
-                coin_count = slot_coin_counts.get(slot_start, 0)
-                if coin_count < AGG_MIN_COINS and slot_start not in carry_forward_slots:
-                    print(
-                        f"[{now_str()}] [mcap-10m] skip slot {slot_start} (coins={coin_count} < min={AGG_MIN_COINS})"
-                    )
-                    continue
+            decision = slot_decisions.get(slot_start, {"action": "write", "source": "direct"})
+            if decision.get("action") != "write":
+                print(f"[{now_str()}] [mcap-10m] skip slot {slot_start} ({decision.get('source')})")
+                continue
             catmap = slot_totals[slot_start]  # Dict[str, {market_cap, volume_24h, last_updated}]
             if slot_start not in carry_forward_slots:
                 catmap = ensure_all_bucket(catmap)
@@ -910,6 +1150,63 @@ def main():
             print(f"[{now_str()}] [mcap-10m] skipped aggregates (gapfill mode; GAPFILL_WRITE_AGG=0)")
         else:
             print(f"[{now_str()}] [mcap-10m] no aggregates captured (coins={len(coins)})")
+
+    # Persist per-slot quality metadata for observability.
+    # If slot_totals had no entry for a requested slot, still write a "no_slot_data" marker.
+    for slot_start, _slot_end in slots:
+        if slot_start not in slot_decisions:
+            slot_decisions[slot_start] = {
+                "action": "skip",
+                "source": "no_slot_data",
+                "note": "no_slot_totals_captured",
+                "coin_count": int(slot_coin_counts.get(slot_start, 0)),
+                "required_ok": False if (AGG_ENFORCE_REQUIRED_IDS and required_id_set) else True,
+                "missing_required_ids": ",".join(sorted(required_id_set)) if (AGG_ENFORCE_REQUIRED_IDS and required_id_set) else None,
+                "raw_all": None,
+                "written_all": None,
+                "prev_all": None,
+                "coverage_ratio": None,
+                "drop_pct": None,
+                "is_quarantined": False,
+                "is_carried": False,
+            }
+
+    if INS_SLOT_QUALITY_PS is not None and slot_decisions:
+        quality_batch = deque()
+        for slot_start in sorted(slot_decisions.keys()):
+            q = slot_decisions[slot_start]
+            quality_batch.append(
+                [
+                    slot_start.date(),
+                    slot_start,
+                    run_mode,
+                    q.get("source"),
+                    q.get("note"),
+                    int(q.get("coin_count") or 0),
+                    bool(q.get("required_ok", True)),
+                    q.get("missing_required_ids"),
+                    float(q["raw_all"]) if q.get("raw_all") is not None else None,
+                    float(q["written_all"]) if q.get("written_all") is not None else None,
+                    float(q["prev_all"]) if q.get("prev_all") is not None else None,
+                    float(q["coverage_ratio"]) if q.get("coverage_ratio") is not None else None,
+                    float(q["drop_pct"]) if q.get("drop_pct") is not None else None,
+                    bool(q.get("is_quarantined", False)),
+                    bool(q.get("is_carried", False)),
+                    datetime.now(timezone.utc),
+                ]
+            )
+        q_written = 0
+        while quality_batch:
+            vals = quality_batch.popleft()
+            try:
+                session.execute(INS_SLOT_QUALITY_PS, vals, timeout=REQUEST_TIMEOUT)
+                q_written += 1
+            except Exception as e:
+                print(f"[{now_str()}] [mcap-10m][WARN] quality row write failed slot={vals[1]}: {e}")
+        print(
+            f"[{now_str()}] [mcap-10m][quality] rows_written={q_written} "
+            f"quarantined={len(quarantined_slots)} carried={len(carry_forward_slots)}"
+        )
 
     print(f"[{now_str()}] [10m] wrote={wrote} skipped={skipped}")
 

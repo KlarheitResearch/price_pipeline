@@ -11,6 +11,10 @@ on:
         description: "Run audit_10m_gaps.py"
         required: false
         default: "true"
+      run_agg_drift:
+        description: "Run audit_10m_aggregate_drift.py"
+        required: false
+        default: "true"
       VERBOSE_MODE:
         description: "Verbose (0/1)"
         required: false
@@ -33,6 +37,7 @@ jobs:
       PYTHONUTF8: "1"
       RUN_AVAIL: ${{ github.event.inputs.run_availability || 'true' }}
       RUN_AUDIT: ${{ github.event.inputs.run_audit || 'true' }}
+      RUN_AGG_DRIFT: ${{ github.event.inputs.run_agg_drift || 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -86,3 +91,22 @@ jobs:
           python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id audit_10m_gaps \
             -- python prices/prod_pipeline/audit_10m_gaps.py
+
+      - name: 10m aggregate drift audit
+        if: env.RUN_AGG_DRIFT == 'true'
+        env:
+          ASTRA_BUNDLE_PATH: secure-connect.zip
+          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
+          TOP_N_DQ: "1000"
+          DRIFT_LOOKBACK_HOURS: "36"
+          DRIFT_REL_THRESHOLD_PCT: "0.03"
+          DRIFT_ABS_THRESHOLD_USD: "50000000000"
+          DRIFT_MIN_COINS: "700"
+          DRIFT_AUTO_REPAIR: "1"
+          DRIFT_MAX_REPAIRS: "6"
+          DRIFT_FAIL_ON_FINDING: "1"
+        run: |
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id audit_10m_aggregate_drift \
+            -- python prices/prod_pipeline/audit_10m_aggregate_drift.py

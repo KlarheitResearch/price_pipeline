@@ -28,7 +28,7 @@ Active workflow set is intentionally small:
 - `gecko_legacy_core.yml`: main 10m cycle for AA + CC + DD.
 - `gecko_legacy_daily_partial.yml`: dedicated EE updates from 10m/live (frequent partial updates + nightly full finalize).
 - `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
-- `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit.
+- `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit + 10m aggregate drift audit.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
 
 All workflow script steps run through:
@@ -50,6 +50,7 @@ Legacy script IDs written to health tables:
 - `EF_gck_close_daily_topn_api`
 - `FF_gck_coin_data_availability`
 - `audit_10m_gaps`
+- `audit_10m_aggregate_drift`
 - `GM_gck_manual_repair_intraday`
 
 ### Coverage and availability tables
@@ -76,6 +77,11 @@ CC runtime tuning knobs (for timeout control):
 - `WRITE_CONCURRENCY` (default `16`) for bounded async insert pipeline depth.
 - `APPEND_SKIP_EXISTING=1` to skip already-filled slots early.
 - `PROGRESS_EVERY` to keep logs light in non-verbose mode.
+- Robustness guards are enabled by default:
+- `REBUILD_AGG_AFTER_APPEND=1` plus auto-rebuild fallback when append skips existing rows.
+- Required-ID gate (`AGG_REQUIRED_IDS`, default `bitcoin,ethereum`) and previous-slot cap coverage gate (`AGG_MIN_PREV_COVERAGE_RATIO`).
+- One-slot V-shape quarantine (`AGG_QUARANTINE_*`, `AGG_VSHAPE_*`) with carry-forward fallback.
+- Slot quality metadata persistence to `gecko_market_cap_10m_quality` (`WRITE_SLOT_QUALITY=1`).
 
 Original prod-era workflow files are archived (not active) at:
 
