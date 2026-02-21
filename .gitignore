@@ -20,5 +20,5 @@ venv/
 
 data/
 
-# Artifacts created by workflows or local runs
-secure-connect.zip
+# Astra Connect ZIP
+secure-connect*.zip
