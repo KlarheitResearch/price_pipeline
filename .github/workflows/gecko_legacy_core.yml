@@ -153,6 +153,17 @@ jobs:
             echo "ASTRA_KEYSPACE_BACKUP=${ASTRA_KEYSPACE_BACKUP}" >> "$GITHUB_ENV"
           fi
 
+      - name: Log Astra target routing
+        run: |
+          echo "[astra-route] ASTRA_TARGET=${ASTRA_TARGET}"
+          echo "[astra-route] ASTRA_KEYSPACE=${ASTRA_KEYSPACE:-unset}"
+          echo "[astra-route] ASTRA_BUNDLE_NAME=${ASTRA_BUNDLE_NAME:-unset}"
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            echo "[astra-route] writing to BACKUP Astra DB"
+          else
+            echo "[astra-route] writing to MAIN Astra DB"
+          fi
+
       - name: AA load live (top 1000)
         if: env.RUN_LIVE == 'true'
         timeout-minutes: 10
