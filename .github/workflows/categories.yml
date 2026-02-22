@@ -22,6 +22,7 @@ jobs:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
+      ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,14 +38,64 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write Astra SCB
-        run: echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
+      - name: Prepare Astra env
+        env:
+          ASTRA_BUNDLE_BASE64_MAIN: ${{ secrets.ASTRA_BUNDLE_BASE64 }}
+          ASTRA_BUNDLE_BASE64_BACKUP: ${{ secrets.ASTRA_BUNDLE_BASE64_BACKUP }}
+          ASTRA_TOKEN_MAIN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN_BACKUP: ${{ secrets.ASTRA_TOKEN_BACKUP }}
+          ASTRA_KEYSPACE_MAIN: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_KEYSPACE_BACKUP: ${{ secrets.ASTRA_KEYSPACE_BACKUP }}
+        run: |
+          set -euo pipefail
+          MAIN_BUNDLE="secure-connect-main.zip"
+          BACKUP_BUNDLE="secure-connect-backup.zip"
+
+          echo "${ASTRA_BUNDLE_BASE64_MAIN}" | base64 -d > "${MAIN_BUNDLE}"
+          test -s "${MAIN_BUNDLE}"
+
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            if [ -z "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_BUNDLE_BASE64_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+            if [ -z "${ASTRA_TOKEN_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_TOKEN_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+          fi
+
+          if [ -n "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+            echo "${ASTRA_BUNDLE_BASE64_BACKUP}" | base64 -d > "${BACKUP_BUNDLE}"
+            test -s "${BACKUP_BUNDLE}"
+          fi
+
+          ACTIVE_BUNDLE="${MAIN_BUNDLE}"
+          ACTIVE_TOKEN="${ASTRA_TOKEN_MAIN}"
+          ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_MAIN}"
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            ACTIVE_BUNDLE="${BACKUP_BUNDLE}"
+            ACTIVE_TOKEN="${ASTRA_TOKEN_BACKUP}"
+            if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+              ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_BACKUP}"
+            fi
+          fi
+
+          echo "ASTRA_BUNDLE_PATH=$PWD" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME=${ACTIVE_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME_BACKUP=${BACKUP_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_TOKEN=${ACTIVE_TOKEN}" >> "$GITHUB_ENV"
+          echo "ASTRA_KEYSPACE=${ACTIVE_KEYSPACE}" >> "$GITHUB_ENV"
+
+          if [ -n "${ASTRA_TOKEN_BACKUP:-}" ]; then
+            echo "ASTRA_TOKEN_BACKUP=${ASTRA_TOKEN_BACKUP}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+            echo "ASTRA_KEYSPACE_BACKUP=${ASTRA_KEYSPACE_BACKUP}" >> "$GITHUB_ENV"
+          fi
 
       - name: Load categories
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           CATEGORY_FILE: prices/prod_pipeline/category_mapping.csv
         run: python prices/load_categories.py
 
@@ -53,8 +104,5 @@ jobs:
 
       - name: Rebuild market-cap aggregates from mapping
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           CATEGORY_FILE: prices/prod_pipeline/category_mapping.csv
         run: python prices/HH_recalculate_mcaps.py

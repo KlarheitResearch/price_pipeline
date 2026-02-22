@@ -45,18 +45,11 @@ chdir_repo_root()
 
 # ───────────────────────── 3rd-party ─────────────────────────
 from cassandra import OperationTimedOut, DriverException, WriteTimeout
-from cassandra.cluster import Cluster, EXEC_PROFILE_DEFAULT, ExecutionProfile
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import RoundRobinPolicy
 from cassandra.query import SimpleStatement, BatchStatement, ConsistencyLevel
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=rel(".env"))
+from astra_connect.connect import AstraConfig, get_session
 
 # ───────────────────────── Config ─────────────────────────
-BUNDLE      = os.getenv("ASTRA_BUNDLE_PATH") or os.getenv("ASTRA_BUNDLE") or "secure-connect.zip"
-ASTRA_TOKEN = os.getenv("ASTRA_TOKEN")
-KEYSPACE    = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+KEYSPACE_OVERRIDE = (os.getenv("ASTRA_KEYSPACE_OVERRIDE") or "").strip()
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
@@ -158,20 +151,14 @@ def cat_for_id(cid: str) -> str:
     return ID_TO_CAT.get((cid or "").lower(), "Other")
 
 # ───────────────────────── Connect ─────────────────────────
-if not BUNDLE or not ASTRA_TOKEN or not KEYSPACE:
-    raise SystemExit("Missing ASTRA_BUNDLE_PATH / ASTRA_TOKEN / ASTRA_KEYSPACE")
-
-print(f"[{now_str()}] [connect] bundle='{BUNDLE}', keyspace='{KEYSPACE}', fetch_size={FETCH_SIZE}, batch_flush={BATCH_FLUSH_EVERY}")
-auth = PlainTextAuthProvider(username="token", password=ASTRA_TOKEN)
-exec_profile = ExecutionProfile(load_balancing_policy=RoundRobinPolicy(),
-                                request_timeout=REQUEST_TIMEOUT_SEC)
-cluster = Cluster(
-    cloud={"secure_connect_bundle": BUNDLE},
-    auth_provider=auth,
-    execution_profiles={EXEC_PROFILE_DEFAULT: exec_profile},
-    connect_timeout=CONNECT_TIMEOUT_SEC,
+cfg = AstraConfig.from_env()
+effective_keyspace = KEYSPACE_OVERRIDE or cfg.keyspace
+print(
+    f"[{now_str()}] [connect] target='{cfg.target}', bundle='{cfg.bundle_path}', "
+    f"keyspace='{effective_keyspace}', fetch_size={FETCH_SIZE}, batch_flush={BATCH_FLUSH_EVERY}"
 )
-session = cluster.connect(KEYSPACE)
+session, cluster = get_session(keyspace=effective_keyspace, return_cluster=True)
+session.default_fetch_size = FETCH_SIZE
 print(f"[{now_str()}] Connected.")
 
 # ───────────────────────── Statements ─────────────────────────

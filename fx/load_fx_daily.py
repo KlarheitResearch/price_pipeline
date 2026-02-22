@@ -4,16 +4,9 @@ import time
 import datetime as dt
 import requests
 
-from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
-from cassandra.auth import PlainTextAuthProvider
-from cassandra.policies import RoundRobinPolicy
-from dotenv import load_dotenv
+from astra_connect.connect import AstraConfig, get_session
 
-load_dotenv()
-
-BUNDLE   = os.getenv("ASTRA_BUNDLE_PATH", "secure-connect.zip")
-TOKEN    = os.getenv("ASTRA_TOKEN")
-KEYSPACE = os.getenv("ASTRA_KEYSPACE", "default_keyspace")
+KEYSPACE_OVERRIDE = (os.getenv("ASTRA_KEYSPACE_OVERRIDE") or "").strip()
 
 PROVIDER = "frankfurter"
 BASE     = "USD"
@@ -59,21 +52,15 @@ def to_pydate(x):
         return None
 
 def cassandra_session():
-    cloud_config = {"secure_connect_bundle": BUNDLE}
-    log(f"Connecting to Cassandra keyspace '{KEYSPACE}' using bundle '{BUNDLE}'")
-    auth = PlainTextAuthProvider("token", TOKEN)
-    cluster = Cluster(
-        cloud=cloud_config,
-        auth_provider=auth,
-        execution_profiles={
-            EXEC_PROFILE_DEFAULT: ExecutionProfile(
-                load_balancing_policy=RoundRobinPolicy()
-            )
-        }
+    cfg = AstraConfig.from_env()
+    keyspace = KEYSPACE_OVERRIDE or cfg.keyspace
+    log(
+        f"Connecting to Cassandra keyspace '{keyspace}' "
+        f"(target={cfg.target}, bundle='{cfg.bundle_path}')"
     )
-    session = cluster.connect(KEYSPACE)
+    session, cluster = get_session(keyspace=keyspace, return_cluster=True)
     log("Cassandra session established")
-    return session
+    return session, cluster
 
 def get_latest(base: str, symbols):
     url = "https://api.frankfurter.app/latest"
@@ -209,7 +196,7 @@ def _parse_payload_date(asof_str: str) -> dt.date:
 
 def main():
     log(f"Starting daily FX load v2 (provider={PROVIDER}, base={BASE})")
-    s = cassandra_session()
+    s, cluster = cassandra_session()
     try:
         # 1) Fetch provider latest (do NOT use local server date for business logic)
         payload = get_latest(BASE, TARGETS)
@@ -290,7 +277,7 @@ def main():
     finally:
         log("Shutting down Cassandra session")
         try:
-            s.shutdown()
+            cluster.shutdown()
         except Exception:
             pass
 

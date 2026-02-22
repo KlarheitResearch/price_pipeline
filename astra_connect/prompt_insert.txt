@@ -1,47 +1,38 @@
-BlockViz Python backend – connection contract (use this in prompts)
+BlockViz Python backend - Astra connection contract
 
-Imports & session:
+Imports and session:
 
 from astra_connect.connect import get_session
-session = get_session()  # returns a cached Astra Cassandra Session (default keyspace)
-
+session = get_session()  # uses ASTRA_TARGET (main by default)
 
 What get_session() guarantees:
 
-Automatically loads .env (prefers ${repo}/.env, falls back to ${repo}/backend/.env) via python-dotenv.
-
-Validates and normalizes required vars; raises a clear error if missing/invalid:
-
-ASTRA_TOKEN (expects AstraCS token)
-
-ASTRA_BUNDLE_PATH (full path to secure connect bundle)
-
-Optional: ASTRA_KEYSPACE (defaults to default_keyspace)
-
-Optional tuning: REQUEST_TIMEOUT_SEC (60), CONNECT_TIMEOUT_SEC (15), FETCH_SIZE (1000)
-
-Builds and reuses a Cassandra Cluster + ExecutionProfile (RoundRobin, timeouts), then returns session connected to the configured keyspace.
-
-Assumptions (workspace):
-
-PYTHONPATH includes the backend/ folder so import astra_connect resolves.
-
-.env lives at backend/.env (or repo root) with unquoted values; on Windows, prefer forward slashes in paths.
+- Loads .env automatically (repo root, backend/.env, or DOTENV_FILE override).
+- Resolves target-specific config:
+  - main: ASTRA_TOKEN, ASTRA_BUNDLE_NAME, ASTRA_KEYSPACE
+  - backup: ASTRA_TOKEN_BACKUP, ASTRA_BUNDLE_NAME_BACKUP, ASTRA_KEYSPACE_BACKUP
+  - selector: ASTRA_TARGET=main|backup
+- Resolves secure bundle path from:
+  - ASTRA_BUNDLE_PATH (folder path) + ASTRA_BUNDLE_NAME[_BACKUP]
+  - or backward-compatible direct zip path in ASTRA_BUNDLE_PATH.
+- Applies request/connect/fetch settings:
+  - REQUEST_TIMEOUT_SEC (default 60)
+  - CONNECT_TIMEOUT_SEC (default 15)
+  - FETCH_SIZE (default 1000)
 
 Options:
 
-get_session(keyspace="...") to override keyspace.
+- get_session(target="main"|"backup") to override ASTRA_TARGET.
+- get_session(keyspace="...") to override keyspace.
+- get_session(return_cluster=True) -> (session, cluster) for explicit shutdown.
+- get_session(override_env_with_dotenv=True) to let .env override shell vars.
 
-get_session(return_cluster=True) → (session, cluster) if the script needs to shut the cluster down explicitly.
-
-get_session(override_env_with_dotenv=True) to let .env override existing shell vars.
-
-Shutdown pattern (only if you requested the cluster):
+Shutdown pattern:
 
 session, cluster = get_session(return_cluster=True)
 try:
-    ...  # work
+    ...
 finally:
     cluster.shutdown()
 
-No per-script path/env hacks: do not modify sys.path or read .env yourself—astra_connect handles it.
+Avoid per-script env/path hacks; use astra_connect.connect as the single source of truth.

@@ -65,6 +65,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
+      ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
 
       RUN_LIVE: ${{ github.event.inputs.run_live || 'true' }}
       RUN_10M: ${{ github.event.inputs.run_10m || 'true' }}
@@ -96,18 +97,66 @@ jobs:
       - name: Export PYTHONPATH (repo root)
         run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
 
-      - name: Astra bundle
+      - name: Prepare Astra env
+        env:
+          ASTRA_BUNDLE_BASE64_MAIN: ${{ secrets.ASTRA_BUNDLE_BASE64 }}
+          ASTRA_BUNDLE_BASE64_BACKUP: ${{ secrets.ASTRA_BUNDLE_BASE64_BACKUP }}
+          ASTRA_TOKEN_MAIN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN_BACKUP: ${{ secrets.ASTRA_TOKEN_BACKUP }}
+          ASTRA_KEYSPACE_MAIN: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_KEYSPACE_BACKUP: ${{ secrets.ASTRA_KEYSPACE_BACKUP }}
         run: |
-          echo "${{ secrets.ASTRA_BUNDLE_BASE64 }}" | base64 -d > secure-connect.zip
-          test -s secure-connect.zip
+          set -euo pipefail
+          MAIN_BUNDLE="secure-connect-main.zip"
+          BACKUP_BUNDLE="secure-connect-backup.zip"
+
+          echo "${ASTRA_BUNDLE_BASE64_MAIN}" | base64 -d > "${MAIN_BUNDLE}"
+          test -s "${MAIN_BUNDLE}"
+
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            if [ -z "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_BUNDLE_BASE64_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+            if [ -z "${ASTRA_TOKEN_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_TOKEN_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+          fi
+
+          if [ -n "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+            echo "${ASTRA_BUNDLE_BASE64_BACKUP}" | base64 -d > "${BACKUP_BUNDLE}"
+            test -s "${BACKUP_BUNDLE}"
+          fi
+
+          ACTIVE_BUNDLE="${MAIN_BUNDLE}"
+          ACTIVE_TOKEN="${ASTRA_TOKEN_MAIN}"
+          ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_MAIN}"
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            ACTIVE_BUNDLE="${BACKUP_BUNDLE}"
+            ACTIVE_TOKEN="${ASTRA_TOKEN_BACKUP}"
+            if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+              ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_BACKUP}"
+            fi
+          fi
+
+          echo "ASTRA_BUNDLE_PATH=$PWD" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME=${ACTIVE_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME_BACKUP=${BACKUP_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_TOKEN=${ACTIVE_TOKEN}" >> "$GITHUB_ENV"
+          echo "ASTRA_KEYSPACE=${ACTIVE_KEYSPACE}" >> "$GITHUB_ENV"
+
+          if [ -n "${ASTRA_TOKEN_BACKUP:-}" ]; then
+            echo "ASTRA_TOKEN_BACKUP=${ASTRA_TOKEN_BACKUP}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+            echo "ASTRA_KEYSPACE_BACKUP=${ASTRA_KEYSPACE_BACKUP}" >> "$GITHUB_ENV"
+          fi
 
       - name: AA load live (top 1000)
         if: env.RUN_LIVE == 'true'
         timeout-minutes: 10
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
           COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
@@ -133,10 +182,6 @@ jobs:
         if: env.RUN_10M == 'true'
         timeout-minutes: 12
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "60"
           CONNECT_TIMEOUT_SEC: "15"
@@ -175,10 +220,6 @@ jobs:
         if: env.RUN_HOURLY == 'true'
         timeout-minutes: 12
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
@@ -199,10 +240,6 @@ jobs:
         if: env.RUN_DAILY_10M == 'true'
         timeout-minutes: 25
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
@@ -223,10 +260,6 @@ jobs:
         if: env.RUN_MONTHLY == 'true'
         timeout-minutes: 8
         env:
-          ASTRA_BUNDLE_PATH: secure-connect.zip
-          ASTRA_TOKEN: ${{ secrets.ASTRA_TOKEN }}
-          ASTRA_KEYSPACE: ${{ secrets.ASTRA_KEYSPACE }}
-
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
