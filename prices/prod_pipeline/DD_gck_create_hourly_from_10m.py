@@ -411,6 +411,9 @@ def main():
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         categories_seen.add(coin_category)
 
+        # Used in logs/range handling for both CURRENT_ONLY and catch-up modes.
+        end_final_hour_excl = curr_hour_start
+
         # In CURRENT_ONLY mode we always process:
         # - previous hour as final
         # - current hour as partial (if needed)
@@ -427,7 +430,6 @@ def main():
                 watermark_hour = None
                 start_hour = curr_hour_start - timedelta(hours=BOOTSTRAP_BACKFILL_HOURS)
 
-            end_final_hour_excl = curr_hour_start
             if MAX_CATCHUP_HOURS > 0:
                 max_start = end_final_hour_excl - timedelta(hours=MAX_CATCHUP_HOURS)
                 if start_hour < max_start:
