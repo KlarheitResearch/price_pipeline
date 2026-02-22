@@ -7,6 +7,7 @@ Features:
 - Paging from source, bounded concurrency to target.
 - Optional target table truncation (explicit flag only).
 - Table subset selection and dry-run mode.
+- Optional recent-row filter by timestamp/date column.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import argparse
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from time import perf_counter
 from typing import Any, Mapping, Sequence, cast
 
@@ -27,6 +28,7 @@ from astra_connect.connect import TARGET_BACKUP, TARGET_MAIN, AstraConfig, get_s
 
 
 MAX_ERROR_SAMPLES = 20
+RECENT_COLUMN_CANDIDATES = ("ts", "date", "last_updated", "updated_at", "created_at")
 
 
 def utc_now_str() -> str:
@@ -52,6 +54,44 @@ def parse_tables_arg(raw: str) -> list[str]:
     if not raw.strip():
         return []
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def choose_recent_column(columns: Sequence[str]) -> str | None:
+    column_set = set(columns)
+    for candidate in RECENT_COLUMN_CANDIDATES:
+        if candidate in column_set:
+            return candidate
+    return None
+
+
+def coerce_to_datetime_utc(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, date):
+        return datetime.combine(value, time.min, tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            if raw.endswith("Z"):
+                raw = raw[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+    return None
 
 
 def _cluster_keyspaces(cluster: Cluster, *, role: str) -> Mapping[str, Any]:
@@ -159,6 +199,7 @@ class TableSummary:
     table: str
     rows_scanned: int = 0
     rows_written: int = 0
+    rows_skipped_recent_filter: int = 0
     errors: int = 0
     duration_sec: float = 0.0
     error_samples: list[str] = field(default_factory=list)
@@ -205,6 +246,7 @@ def copy_table(
     page_size: int,
     max_concurrency: int,
     progress_every: int,
+    recent_hours: int,
 ) -> TableSummary:
     started = perf_counter()
     summary = TableSummary(table=table)
@@ -217,8 +259,25 @@ def copy_table(
 
     col_sql = ", ".join(qident(c) for c in columns)
     placeholders = ", ".join("?" for _ in columns)
+    recent_column = choose_recent_column(columns) if recent_hours > 0 else None
+    recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=recent_hours)
+        if recent_hours > 0 and recent_column is not None
+        else None
+    )
 
     print(f"[{utc_now_str()}] [table={table}] start columns={len(columns)}")
+    if recent_hours > 0:
+        if recent_column and recent_cutoff:
+            print(
+                f"[{utc_now_str()}] [table={table}] recent filter: "
+                f"column={recent_column} cutoff={recent_cutoff.isoformat()}"
+            )
+        else:
+            print(
+                f"[{utc_now_str()}] [table={table}] recent filter requested but no supported "
+                f"time column found; writing all scanned rows"
+            )
     if truncate_target:
         if dry_run:
             print(f"[{utc_now_str()}] [table={table}] dry-run: would TRUNCATE {target_name}")
@@ -242,10 +301,18 @@ def copy_table(
 
     for row in source_session.execute(select_stmt, timeout=None):
         summary.rows_scanned += 1
+        should_write = True
+
+        if recent_cutoff and recent_column:
+            row_dt = coerce_to_datetime_utc(row_value(row, recent_column))
+            if row_dt is not None and row_dt < recent_cutoff:
+                should_write = False
+                summary.rows_skipped_recent_filter += 1
 
         if dry_run:
-            summary.rows_written = summary.rows_scanned
-        else:
+            if should_write:
+                summary.rows_written += 1
+        elif should_write:
             pending.append(tuple(row_value(row, c) for c in columns))
             if len(pending) >= chunk_size:
                 flush_args(
@@ -260,7 +327,8 @@ def copy_table(
         if summary.rows_scanned % progress_every == 0:
             print(
                 f"[{utc_now_str()}] [table={table}] progress "
-                f"scanned={summary.rows_scanned} written={summary.rows_written} errors={summary.errors}"
+                f"scanned={summary.rows_scanned} written={summary.rows_written} "
+                f"skipped_recent={summary.rows_skipped_recent_filter} errors={summary.errors}"
             )
 
     if not dry_run and pending:
@@ -276,6 +344,7 @@ def copy_table(
     print(
         f"[{utc_now_str()}] [table={table}] done "
         f"scanned={summary.rows_scanned} written={summary.rows_written} "
+        f"skipped_recent={summary.rows_skipped_recent_filter} "
         f"errors={summary.errors} duration={summary.duration_sec:.1f}s"
     )
     return summary
@@ -297,6 +366,8 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit("--max-concurrency must be > 0")
     if args.progress_every <= 0:
         raise SystemExit("--progress-every must be > 0")
+    if args.recent_hours < 0:
+        raise SystemExit("--recent-hours must be >= 0")
 
     source_cfg = AstraConfig.from_env(target=args.source_target)
     target_cfg = AstraConfig.from_env(target=args.target_target)
@@ -306,7 +377,8 @@ def run(args: argparse.Namespace) -> int:
         f"source_target={source_cfg.target} target_target={target_cfg.target} "
         f"source_keyspace={source_cfg.keyspace} target_keyspace={target_cfg.keyspace} "
         f"dry_run={args.dry_run} truncate_target={args.truncate_target} "
-        f"page_size={args.page_size} max_concurrency={args.max_concurrency}"
+        f"page_size={args.page_size} max_concurrency={args.max_concurrency} "
+        f"recent_hours={args.recent_hours}"
     )
     print(f"[{utc_now_str()}] idempotency: inserts are upserts; reruns are safe.")
 
@@ -380,6 +452,7 @@ def run(args: argparse.Namespace) -> int:
                     page_size=args.page_size,
                     max_concurrency=args.max_concurrency,
                     progress_every=args.progress_every,
+                    recent_hours=args.recent_hours,
                 )
             except Exception as exc:
                 summary = TableSummary(table=table)
@@ -405,19 +478,22 @@ def run(args: argparse.Namespace) -> int:
     total_duration = perf_counter() - started
     total_scanned = sum(s.rows_scanned for s in summaries)
     total_written = sum(s.rows_written for s in summaries)
+    total_skipped_recent = sum(s.rows_skipped_recent_filter for s in summaries)
     total_errors = sum(s.errors for s in summaries)
 
     print("")
     print("Migration summary")
     print(
         f"total_tables={len(summaries)} total_scanned={total_scanned} "
-        f"total_written={total_written} total_errors={total_errors} "
+        f"total_written={total_written} total_skipped_recent={total_skipped_recent} "
+        f"total_errors={total_errors} "
         f"duration={total_duration:.1f}s"
     )
     for s in summaries:
         print(
             f" - {s.table}: scanned={s.rows_scanned} "
-            f"written={s.rows_written} errors={s.errors} duration={s.duration_sec:.1f}s"
+            f"written={s.rows_written} skipped_recent={s.rows_skipped_recent_filter} "
+            f"errors={s.errors} duration={s.duration_sec:.1f}s"
         )
         for msg in s.error_samples:
             print(f"    error: {msg}")
@@ -485,6 +561,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("MIGRATE_PAGE_SIZE", "500")),
         help="Source read page size.",
+    )
+    parser.add_argument(
+        "--recent-hours",
+        type=int,
+        default=int(os.getenv("MIGRATE_RECENT_HOURS", "0")),
+        help=(
+            "Only upsert rows whose ts/date/last_updated/updated_at/created_at is within "
+            "the last N hours. 0 disables the recent-row filter."
+        ),
     )
     parser.add_argument(
         "--schema-only",

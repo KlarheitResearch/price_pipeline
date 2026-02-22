@@ -411,20 +411,31 @@ def main():
         coin_category = (getattr(c, 'category', None) or 'Other').strip() or 'Other'
         categories_seen.add(coin_category)
 
-        watermark_ts = get_latest_final_ts(c.id)
-        if watermark_ts:
-            watermark_hour = floor_hour(watermark_ts)
-            start_hour = watermark_hour + timedelta(hours=1)
-        else:
+        # In CURRENT_ONLY mode we always process:
+        # - previous hour as final
+        # - current hour as partial (if needed)
+        # so per-coin watermark lookups are unnecessary overhead.
+        if CURRENT_ONLY:
             watermark_hour = None
-            start_hour = curr_hour_start - timedelta(hours=BOOTSTRAP_BACKFILL_HOURS)
+            start_hour = prev_final
+        else:
+            watermark_ts = get_latest_final_ts(c.id)
+            if watermark_ts:
+                watermark_hour = floor_hour(watermark_ts)
+                start_hour = watermark_hour + timedelta(hours=1)
+            else:
+                watermark_hour = None
+                start_hour = curr_hour_start - timedelta(hours=BOOTSTRAP_BACKFILL_HOURS)
 
-        end_final_hour_excl = curr_hour_start
-        if MAX_CATCHUP_HOURS > 0:
-            max_start = end_final_hour_excl - timedelta(hours=MAX_CATCHUP_HOURS)
-            if start_hour < max_start:
-                print(f"[{now_str()}]    {c.symbol} clamp start {start_hour.isoformat()} -> {max_start.isoformat()} (MAX_CATCHUP_HOURS={MAX_CATCHUP_HOURS})")
-                start_hour = max_start
+            end_final_hour_excl = curr_hour_start
+            if MAX_CATCHUP_HOURS > 0:
+                max_start = end_final_hour_excl - timedelta(hours=MAX_CATCHUP_HOURS)
+                if start_hour < max_start:
+                    print(
+                        f"[{now_str()}]    {c.symbol} clamp start {start_hour.isoformat()} "
+                        f"-> {max_start.isoformat()} (MAX_CATCHUP_HOURS={MAX_CATCHUP_HOURS})"
+                    )
+                    start_hour = max_start
 
         hours: List[Tuple[datetime, datetime, bool]] = []
         if CURRENT_ONLY:

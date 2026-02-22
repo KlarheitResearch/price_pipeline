@@ -393,20 +393,25 @@ def main():
                 f"({getattr(c,'id','?')}) rank={getattr(c,'market_cap_rank','?')}"
             )
 
-        watermark_date = get_latest_final_date(c.id)
-        if watermark_date:
-            start_day = watermark_date + timedelta(days=1)
+        # In CURRENT_ONLY mode we only update today's partial candle,
+        # so watermark queries for finalized history are unnecessary.
+        if CURRENT_ONLY:
+            start_day = today
         else:
-            start_day = yesterday - timedelta(days=BOOTSTRAP_BACKFILL_DAYS - 1)
+            watermark_date = get_latest_final_date(c.id)
+            if watermark_date:
+                start_day = watermark_date + timedelta(days=1)
+            else:
+                start_day = yesterday - timedelta(days=BOOTSTRAP_BACKFILL_DAYS - 1)
 
-        if MAX_CATCHUP_DAYS > 0:
-            max_start = yesterday - timedelta(days=MAX_CATCHUP_DAYS - 1)
-            if start_day < max_start:
-                print(
-                    f"[{now_str()}]    {c.symbol} clamp start {start_day} -> {max_start} "
-                    f"(MAX_CATCHUP_DAYS={MAX_CATCHUP_DAYS})"
-                )
-                start_day = max_start
+            if MAX_CATCHUP_DAYS > 0:
+                max_start = yesterday - timedelta(days=MAX_CATCHUP_DAYS - 1)
+                if start_day < max_start:
+                    print(
+                        f"[{now_str()}]    {c.symbol} clamp start {start_day} -> {max_start} "
+                        f"(MAX_CATCHUP_DAYS={MAX_CATCHUP_DAYS})"
+                    )
+                    start_day = max_start
 
         final_days: List[date] = []
         if (not CURRENT_ONLY) and start_day <= yesterday:

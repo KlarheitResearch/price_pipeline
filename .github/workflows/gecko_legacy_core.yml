@@ -229,7 +229,7 @@ jobs:
 
       - name: DD update hourly from 10m
         if: env.RUN_HOURLY == 'true'
-        timeout-minutes: 12
+        timeout-minutes: 20
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "40"
@@ -238,7 +238,8 @@ jobs:
           SLOT_DELAY_SEC: "120"
           CURRENT_ONLY: "${{ env.CURRENT_ONLY_RESOLVED }}"
           FINALIZE_PREV: "1"
-          PROGRESS_EVERY: "20"
+          PROGRESS_EVERY: "50"
+          WRITE_CONCURRENCY: "48"
           AGG_MIN_COINS: "700"
           AGG_CARRY_FORWARD: "1"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
