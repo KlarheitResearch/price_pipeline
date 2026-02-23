@@ -1,8 +1,20 @@
 # load_fx_daily.py
 import os
+import pathlib
+import sys
 import time
 import datetime as dt
 import requests
+
+_THIS_FILE = pathlib.Path(__file__).resolve()
+_SEARCH_ROOTS = (
+    _THIS_FILE.parent.parent,          # backend/ (current repo layout)
+    _THIS_FILE.parent.parent / "backend",  # repo root + backend/ (pipeline repo layout)
+)
+for _root in _SEARCH_ROOTS:
+    if (_root / "astra_connect").is_dir() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
+        break
 
 from astra_connect.connect import AstraConfig, get_session
 

@@ -108,4 +108,4 @@ jobs:
         env:
           REQUEST_TIMEOUT_SEC: "60"
           CONNECT_TIMEOUT_SEC: "15"
-        run: python fx/load_fx_daily.py
+        run: python -m fx.load_fx_daily
