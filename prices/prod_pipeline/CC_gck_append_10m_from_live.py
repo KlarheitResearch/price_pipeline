@@ -224,10 +224,12 @@ INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     """
 )
 
-# Existing 10m slots for an id in a time window (used in gapfill mode)
+# Existing 10m rows for an id in a time window.
+# Includes values so carry-state can stay aligned when slots already exist.
 SEL_10M_EXISTING_TS_RANGE_PS = session.prepare(
     f"""
-    SELECT ts
+    SELECT ts, price_usd, market_cap, volume_24h,
+           market_cap_rank, circulating_supply, total_supply, last_updated
     FROM {TABLE_OUT}
     WHERE id=? AND ts>=? AND ts<?
     """
@@ -535,6 +537,7 @@ def plan_coin_slots(
     w_end = slots[-1][1]
 
     existing_ts: set[datetime] = set()
+    existing_points: Dict[datetime, Dict[str, Any]] = {}
     should_prefetch_existing = run_mode == "gapfill" or (run_mode == "append" and APPEND_SKIP_EXISTING)
     if should_prefetch_existing:
         try:
@@ -549,6 +552,11 @@ def plan_coin_slots(
                     ts_utc = to_utc(ts0)
                     if ts_utc is not None:
                         existing_ts.add(ts_utc)
+                        point = _point_from_row(r)
+                        if point is not None:
+                            prev_point = existing_points.get(ts_utc)
+                            if prev_point is None or point["last_updated"] > prev_point["last_updated"]:
+                                existing_points[ts_utc] = point
         except Exception as e:
             out["plan_error"] = f"existing-range read failed: {e}"
             return out
@@ -589,6 +597,12 @@ def plan_coin_slots(
     entries: List[Dict[str, Any]] = []
     for start, end in slots:
         if start in existing_ts:
+            # Keep carry chain aligned with persisted rows in this window.
+            # Without this, a missing tail slot can carry from a stale pre-window point.
+            existing_point = existing_points.get(start)
+            if existing_point is not None:
+                last_real_point = existing_point
+                carry_used = 0
             entries.append({"kind": "existing", "start": start, "end": end})
             continue
 
