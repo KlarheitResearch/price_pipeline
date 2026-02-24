@@ -15,8 +15,8 @@
 # - Targets are TRUNCATEd first, then fully repopulated.
 
 import os, sys, pathlib, csv, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta, date
-from collections import defaultdict
 from typing import Dict
 
 # ───────────────────── Repo root & helpers ─────────────────────
@@ -55,6 +55,9 @@ REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 CONNECT_TIMEOUT_SEC = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
 FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 BATCH_FLUSH_EVERY   = int(os.getenv("BATCH_FLUSH_EVERY", "50"))
+COIN_WORKERS        = max(1, int(os.getenv("COIN_WORKERS", "6")))
+READ_PROGRESS_EVERY_IDS = max(1, int(os.getenv("READ_PROGRESS_EVERY_IDS", "20")))
+WRITE_LOG_EVERY     = max(1, int(os.getenv("WRITE_LOG_EVERY", str(BATCH_FLUSH_EVERY * 20))))
 
 # Aggregate safety: abort rebuild if too few live IDs (avoid truncating with partial data)
 AGG_MIN_COINS = int(os.getenv("AGG_MIN_COINS", "200"))
@@ -155,7 +158,8 @@ cfg = AstraConfig.from_env()
 effective_keyspace = KEYSPACE_OVERRIDE or cfg.keyspace
 print(
     f"[{now_str()}] [connect] target='{cfg.target}', bundle='{cfg.bundle_path}', "
-    f"keyspace='{effective_keyspace}', fetch_size={FETCH_SIZE}, batch_flush={BATCH_FLUSH_EVERY}"
+    f"keyspace='{effective_keyspace}', fetch_size={FETCH_SIZE}, batch_flush={BATCH_FLUSH_EVERY}, "
+    f"coin_workers={COIN_WORKERS}"
 )
 session, cluster = get_session(keyspace=effective_keyspace, return_cluster=True)
 session.default_fetch_size = FETCH_SIZE
@@ -204,57 +208,101 @@ def agg_add(bucket_map, bucket_key, category, last_updated, market_cap, volume_2
     anew_lu = last_updated if (alu is None or (last_updated and last_updated > alu)) else alu
     by_cat["ALL"] = (anew_lu, (amc or 0.0) + (market_cap or 0.0), (avol or 0.0) + (volume_24h or 0.0))
 
+def merge_bucket_maps(dst_map, src_map):
+    for bucket_key, src_catmap in src_map.items():
+        dst_catmap = dst_map.setdefault(bucket_key, {})
+        for category, (src_lu, src_mc, src_vol) in src_catmap.items():
+            dst_lu, dst_mc, dst_vol = dst_catmap.get(category, (None, 0.0, 0.0))
+            if dst_lu is None or (src_lu and src_lu > dst_lu):
+                dst_lu = src_lu
+            dst_catmap[category] = (
+                dst_lu,
+                (dst_mc or 0.0) + (src_mc or 0.0),
+                (dst_vol or 0.0) + (src_vol or 0.0),
+            )
+
+def aggregate_single_id(cid: str):
+    cat = cat_for_id(cid)
+    acc_10m = {}
+    acc_hourly = {}
+    acc_daily = {}
+    cnt_10m = 0
+    cnt_hourly = 0
+    cnt_daily = 0
+
+    rows = session.execute(SEL_10M_RANGE, [cid, WIN_10M_START, WIN_10M_END], timeout=REQUEST_TIMEOUT_SEC)
+    for r in rows:
+        cnt_10m += 1
+        ts  = getattr(r, "ts", None)
+        lu  = getattr(r, "last_updated", None)
+        m   = getattr(r, "market_cap", None) or 0.0
+        v   = getattr(r, "volume_24h", None) or 0.0
+        if ts is not None:
+            agg_add(acc_10m, ts, cat, lu, m, v)
+
+    rows = session.execute(SEL_H_RANGE, [cid, WIN_H_START, WIN_H_END], timeout=REQUEST_TIMEOUT_SEC)
+    for r in rows:
+        cnt_hourly += 1
+        ts  = getattr(r, "ts", None)
+        lu  = getattr(r, "last_updated", None)
+        m   = getattr(r, "market_cap", None) or 0.0
+        v   = getattr(r, "volume_24h", None) or 0.0
+        if ts is not None:
+            agg_add(acc_hourly, ts, cat, lu, m, v)
+
+    rows = session.execute(SEL_D_RANGE, [cid, WIN_D_START, WIN_D_END], timeout=REQUEST_TIMEOUT_SEC)
+    for r in rows:
+        cnt_daily += 1
+        d   = getattr(r, "date", None)
+        lu  = getattr(r, "last_updated", None)
+        m   = getattr(r, "market_cap", None) or 0.0
+        v   = getattr(r, "volume_24h", None) or 0.0
+        if d is not None:
+            agg_add(acc_daily, d, cat, lu, m, v)
+
+    return cid, acc_10m, acc_hourly, acc_daily, cnt_10m, cnt_hourly, cnt_daily
+
 def aggregate_for_ids(ids):
     acc_10m = {}
     acc_hourly = {}
     acc_daily = {}
     n_ids = len(ids)
     t0 = time.time()
-    for idx, cid in enumerate(ids, 1):
-        if (idx == 1) or (idx % 10 == 0) or (idx == n_ids):
-            print(f"[{now_str()}] [read] id {idx}/{n_ids}: {cid}")
+    total_10m_rows = 0
+    total_hourly_rows = 0
+    total_daily_rows = 0
 
-        rows = session.execute(SEL_10M_RANGE, [cid, WIN_10M_START, WIN_10M_END], timeout=REQUEST_TIMEOUT_SEC)
-        cnt = 0
-        for r in rows:
-            cnt += 1
-            ts  = getattr(r, "ts", None)
-            lu  = getattr(r, "last_updated", None)
-            m   = getattr(r, "market_cap", None) or 0.0
-            v   = getattr(r, "volume_24h", None) or 0.0
-            cat = cat_for_id(cid)
-            if ts is not None:
-                agg_add(acc_10m, ts, cat, lu, m, v)
-        if cnt and (idx % 20 == 0):
-            print(f"[{now_str()}]   10m rows read so far for id#{idx}: {cnt} (elapsed {time.time()-t0:.1f}s)")
+    with ThreadPoolExecutor(max_workers=COIN_WORKERS) as pool:
+        futures = {pool.submit(aggregate_single_id, cid): cid for cid in ids}
+        for done, fut in enumerate(as_completed(futures), 1):
+            cid = futures[fut]
+            try:
+                (
+                    cid,
+                    id_acc_10m,
+                    id_acc_hourly,
+                    id_acc_daily,
+                    id_cnt_10m,
+                    id_cnt_hourly,
+                    id_cnt_daily,
+                ) = fut.result()
+            except Exception as e:
+                print(f"[{now_str()}] [read] failed for id '{cid}': {e}")
+                raise
 
-        rows = session.execute(SEL_H_RANGE, [cid, WIN_H_START, WIN_H_END], timeout=REQUEST_TIMEOUT_SEC)
-        cnt = 0
-        for r in rows:
-            cnt += 1
-            ts  = getattr(r, "ts", None)
-            lu  = getattr(r, "last_updated", None)
-            m   = getattr(r, "market_cap", None) or 0.0
-            v   = getattr(r, "volume_24h", None) or 0.0
-            cat = cat_for_id(cid)
-            if ts is not None:
-                agg_add(acc_hourly, ts, cat, lu, m, v)
-        if cnt and (idx % 20 == 0):
-            print(f"[{now_str()}]   hourly rows read so far for id#{idx}: {cnt} (elapsed {time.time()-t0:.1f}s)")
+            merge_bucket_maps(acc_10m, id_acc_10m)
+            merge_bucket_maps(acc_hourly, id_acc_hourly)
+            merge_bucket_maps(acc_daily, id_acc_daily)
+            total_10m_rows += id_cnt_10m
+            total_hourly_rows += id_cnt_hourly
+            total_daily_rows += id_cnt_daily
 
-        rows = session.execute(SEL_D_RANGE, [cid, WIN_D_START, WIN_D_END], timeout=REQUEST_TIMEOUT_SEC)
-        cnt = 0
-        for r in rows:
-            cnt += 1
-            d   = getattr(r, "date", None)
-            lu  = getattr(r, "last_updated", None)
-            m   = getattr(r, "market_cap", None) or 0.0
-            v   = getattr(r, "volume_24h", None) or 0.0
-            cat = cat_for_id(cid)
-            if d is not None:
-                agg_add(acc_daily, d, cat, lu, m, v)
-        if cnt and (idx % 20 == 0):
-            print(f"[{now_str()}]   daily rows read so far for id#{idx}: {cnt} (elapsed {time.time()-t0:.1f}s)")
+            if (done == 1) or (done % READ_PROGRESS_EVERY_IDS == 0) or (done == n_ids):
+                print(
+                    f"[{now_str()}] [read] id {done}/{n_ids}: {cid} "
+                    f"(rows 10m={total_10m_rows}, hourly={total_hourly_rows}, daily={total_daily_rows}, "
+                    f"elapsed {time.time()-t0:.1f}s)"
+                )
 
     return acc_10m, acc_hourly, acc_daily
 
@@ -288,6 +336,9 @@ def ensure_all_bucket(catmap):
     catmap["ALL"] = (latest_lu, total_mcap, total_vol)
     return catmap
 
+def should_log_write(total_rows: int) -> bool:
+    return (total_rows % WRITE_LOG_EVERY) == 0
+
 def flush_10m(session, acc_10m, INS_10M, batch_every=BATCH_FLUSH_EVERY):
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
     total = 0
@@ -302,7 +353,8 @@ def flush_10m(session, acc_10m, INS_10M, batch_every=BATCH_FLUSH_EVERY):
             total += 1
             if (total % batch_every) == 0:
                 session.execute(batch); batch.clear()
-                print(f"[{now_str()}] [write] flushed total={total}  (10m={total}, hourly=0, daily=0)  elapsed={time.time()-t0:.1f}s")
+                if should_log_write(total):
+                    print(f"[{now_str()}] [write] flushed total={total}  (10m={total}, hourly=0, daily=0)  elapsed={time.time()-t0:.1f}s")
     if len(batch):
         session.execute(batch)
     print(f"[{now_str()}] [write] 10m done: rows={total}")
@@ -322,7 +374,8 @@ def flush_hourly(session, acc_hourly, INS_H, batch_every=BATCH_FLUSH_EVERY):
             total += 1
             if (total % batch_every) == 0:
                 session.execute(batch); batch.clear()
-                print(f"[{now_str()}] [write] flushed total={total}  (10m=0, hourly={total}, daily=0)  elapsed={time.time()-t0:.1f}s")
+                if should_log_write(total):
+                    print(f"[{now_str()}] [write] flushed total={total}  (10m=0, hourly={total}, daily=0)  elapsed={time.time()-t0:.1f}s")
     if len(batch):
         session.execute(batch)
     print(f"[{now_str()}] [write] hourly done: rows={total}")
@@ -342,7 +395,8 @@ def flush_daily(session, acc_daily, INS_D, batch_every=BATCH_FLUSH_EVERY):
             total += 1
             if (total % batch_every) == 0:
                 session.execute(batch); batch.clear()
-                print(f"[{now_str()}] [write] flushed total={total}  (10m=0, hourly=0, daily={total})  elapsed={time.time()-t0:.1f}s")
+                if should_log_write(total):
+                    print(f"[{now_str()}] [write] flushed total={total}  (10m=0, hourly=0, daily={total})  elapsed={time.time()-t0:.1f}s")
     if len(batch):
         session.execute(batch)
     print(f"[{now_str()}] [write] daily done: rows={total}")

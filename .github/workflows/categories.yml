@@ -1,7 +1,7 @@
 name: categories
 on:
   schedule:
-    - cron: "12 5 * * *" # daily at 03:12 UTC
+    - cron: "12 5 */2 * *" # every 2 days at 05:12 UTC
   push:
     paths:
       - "prices/prod_pipeline/category_mapping.csv"
@@ -17,7 +17,7 @@ permissions:
 jobs:
   load:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -110,10 +110,11 @@ jobs:
           CATEGORY_FILE: prices/prod_pipeline/category_mapping.csv
         run: python prices/load_categories.py
 
-      - name: Wait for category load to settle
-        run: sleep 15
-
       - name: Rebuild market-cap aggregates from mapping
         env:
           CATEGORY_FILE: prices/prod_pipeline/category_mapping.csv
+          COIN_WORKERS: "8"
+          BATCH_FLUSH_EVERY: "200"
+          WRITE_LOG_EVERY: "2000"
+          READ_PROGRESS_EVERY_IDS: "25"
         run: python prices/HH_recalculate_mcaps.py
