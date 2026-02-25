@@ -1,6 +1,7 @@
 # load_fx_daily.py
 import os
 import pathlib
+import random
 import sys
 import time
 import datetime as dt
@@ -31,6 +32,24 @@ TARGETS  = [
 TBL_DAILY  = "fx_rates_daily_by_symbol"
 TBL_LIVE   = "fx_rates_live"
 TBL_STATUS = "fx_status"
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    raw = (os.getenv(name, default) or "").strip().lower()
+    return raw in {"1", "true", "t", "yes", "y", "on"}
+
+HTTP_MAX_ATTEMPTS = max(1, int(os.getenv("FX_HTTP_MAX_ATTEMPTS", "7")))
+HTTP_CONNECT_TIMEOUT = max(1.0, float(os.getenv("FX_HTTP_CONNECT_TIMEOUT", "5")))
+HTTP_READ_TIMEOUT = max(1.0, float(os.getenv("FX_HTTP_READ_TIMEOUT", "25")))
+HTTP_BACKOFF_BASE_SECS = max(0.1, float(os.getenv("FX_HTTP_BACKOFF_BASE_SECS", "1")))
+HTTP_BACKOFF_CAP_SECS = max(0.5, float(os.getenv("FX_HTTP_BACKOFF_CAP_SECS", "30")))
+HTTP_JITTER_SECS = max(0.0, float(os.getenv("FX_HTTP_JITTER_SECS", "0.5")))
+
+ALLOW_STALE_ON_FETCH_FAILURE = _env_bool("FX_ALLOW_STALE_ON_FETCH_FAILURE", "1")
+MAX_STALE_DAYS = max(0, int(os.getenv("FX_STALE_MAX_DAYS", "3")))
+ALLOW_RANGE_DEGRADED_SUCCESS = _env_bool("FX_ALLOW_RANGE_DEGRADED_SUCCESS", "1")
+
+_HTTP = requests.Session()
+_HTTP.headers.update({"User-Agent": "blockviz-fx-loader/2"})
 
 def log(msg: str) -> None:
     now = dt.datetime.now().isoformat(timespec="seconds")
@@ -74,44 +93,73 @@ def cassandra_session():
     log("Cassandra session established")
     return session, cluster
 
+def _request_json(url: str, params: dict, label: str):
+    last_err = None
+    for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+        try:
+            log(
+                f"{label}: attempt {attempt}/{HTTP_MAX_ATTEMPTS} "
+                f"(connect_timeout={HTTP_CONNECT_TIMEOUT}s, read_timeout={HTTP_READ_TIMEOUT}s)"
+            )
+            r = _HTTP.get(url, params=params, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT))
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt == HTTP_MAX_ATTEMPTS:
+                break
+            wait = min(HTTP_BACKOFF_CAP_SECS, HTTP_BACKOFF_BASE_SECS * (2 ** (attempt - 1)))
+            wait += random.uniform(0, HTTP_JITTER_SECS)
+            log(
+                f"{label}: attempt {attempt}/{HTTP_MAX_ATTEMPTS} failed: {e}. "
+                f"Retrying in {wait:.1f}s..."
+            )
+            time.sleep(wait)
+    raise RuntimeError(f"{label} failed after {HTTP_MAX_ATTEMPTS} attempts: {last_err}") from last_err
+
+def _allow_stale_success(prev: dt.date | None) -> bool:
+    if not ALLOW_STALE_ON_FETCH_FAILURE:
+        return False
+    if prev is None:
+        log("Stale-success disabled: no previous watermark in fx_status")
+        return False
+    today_utc = dt.datetime.now(dt.timezone.utc).date()
+    age_days = max(0, (today_utc - prev).days)
+    if age_days <= MAX_STALE_DAYS:
+        log(
+            f"Allowing stale-success: latest watermark {prev} is {age_days} day(s) old "
+            f"(max allowed={MAX_STALE_DAYS})"
+        )
+        return True
+    log(
+        f"Stale-success rejected: latest watermark {prev} is {age_days} day(s) old "
+        f"(max allowed={MAX_STALE_DAYS})"
+    )
+    return False
+
 def get_latest(base: str, symbols):
     url = "https://api.frankfurter.app/latest"
     params = {"from": base, "to": ",".join(symbols)}
-    for attempt in range(5):
-        try:
-            log(f"Fetching latest FX rates (attempt {attempt+1}/5) for base={base} ({len(symbols)} symbols)")
-            r = requests.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            data = r.json()  # {'amount':1,'base':'USD','date':'YYYY-MM-DD','rates':{...}}
-            log(f"Fetched latest provider date {data.get('date')} with {len(data.get('rates', {}))} symbol(s)")
-            return data
-        except Exception as e:
-            wait = 2 ** attempt
-            if attempt == 4:
-                log(f"Failed to fetch latest rates: {e}")
-                raise
-            log(f"Attempt {attempt+1}/5 failed: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
+    data = _request_json(
+        url=url,
+        params=params,
+        label=f"Fetching latest FX rates for base={base} ({len(symbols)} symbols)",
+    )
+    log(f"Fetched latest provider date {data.get('date')} with {len(data.get('rates', {}))} symbol(s)")
+    return data
 
 def frankfurter_range(start_date: str, end_date: str, base: str, symbols):
     url = f"https://api.frankfurter.app/{start_date}..{end_date}"
     params = {"from": base, "to": ",".join(symbols)}
     log(f"Fetching range {start_date}..{end_date} for base={base} ({len(symbols)} symbols)")
-    for attempt in range(5):
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-            days = len(data.get("rates", {}))
-            log(f"Range {start_date}..{end_date} returned {days} day(s) with data")
-            return data
-        except Exception as e:
-            wait = 2 ** attempt
-            if attempt == 4:
-                log(f"Failed range fetch {start_date}..{end_date}: {e}")
-                raise
-            log(f"Range attempt {attempt+1}/5 failed: {e}. Retrying in {wait}s...")
-            time.sleep(wait)
+    data = _request_json(
+        url=url,
+        params=params,
+        label=f"Fetching FX range {start_date}..{end_date}",
+    )
+    days = len(data.get("rates", {}))
+    log(f"Range {start_date}..{end_date} returned {days} day(s) with data")
+    return data
 
 def read_latest_status(s):
     row = s.execute(
@@ -211,7 +259,16 @@ def main():
     s, cluster = cassandra_session()
     try:
         # 1) Fetch provider latest (do NOT use local server date for business logic)
-        payload = get_latest(BASE, TARGETS)
+        try:
+            payload = get_latest(BASE, TARGETS)
+        except Exception as latest_err:
+            log(f"Failed to fetch latest provider payload: {latest_err}")
+            prev_raw = read_latest_status(s)
+            prev = to_pydate(prev_raw)
+            if _allow_stale_success(prev):
+                log("Exiting successfully with stale FX data because provider latest fetch is unavailable")
+                return
+            raise
         asof_str = payload.get("date")  # latest provider business date
         if not asof_str:
             raise RuntimeError("Frankfurter payload missing 'date'")
@@ -236,7 +293,20 @@ def main():
             start = prev.isoformat()
             end   = latest_provider_date.isoformat()
 
-            data = frankfurter_range(start, end, BASE, TARGETS)
+            try:
+                data = frankfurter_range(start, end, BASE, TARGETS)
+            except Exception as range_err:
+                if not ALLOW_RANGE_DEGRADED_SUCCESS:
+                    raise
+                gap_days = max(0, (latest_provider_date - prev).days - 1)
+                log(
+                    f"Range fetch failed ({range_err}); entering degraded mode. "
+                    f"Publishing latest payload only and keeping watermark at {prev}. "
+                    f"Missing historical days to recover later: up to {gap_days}"
+                )
+                publish_observed_day(s, latest_provider_date, latest_rates, source="observed")
+                log("Degraded run completed: live/latest date refreshed without watermark advancement")
+                return
 
             # Frankfurter returns a dict { 'YYYY-MM-DD': { 'EUR': 0.9, ... }, ... }
             rates_by_day = data.get("rates", {}) or {}
