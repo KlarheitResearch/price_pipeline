@@ -28,15 +28,124 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  availability:
+    if: ${{ (github.event.inputs.run_availability || 'true') == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
-      RUN_AVAIL: ${{ github.event.inputs.run_availability || 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export PYTHONPATH (repo root)
+        run: echo "PYTHONPATH=." >> "$GITHUB_ENV"
+
+      - name: Prepare Astra env
+        env:
+          ASTRA_BUNDLE_BASE64_MAIN: ${{ secrets.ASTRA_BUNDLE_BASE64 }}
+          ASTRA_BUNDLE_BASE64_BACKUP: ${{ secrets.ASTRA_BUNDLE_BASE64_BACKUP }}
+          ASTRA_TOKEN_MAIN: ${{ secrets.ASTRA_TOKEN }}
+          ASTRA_TOKEN_BACKUP: ${{ secrets.ASTRA_TOKEN_BACKUP }}
+          ASTRA_KEYSPACE_MAIN: ${{ secrets.ASTRA_KEYSPACE }}
+          ASTRA_KEYSPACE_BACKUP: ${{ secrets.ASTRA_KEYSPACE_BACKUP }}
+        run: |
+          set -euo pipefail
+          MAIN_BUNDLE="secure-connect-main.zip"
+          BACKUP_BUNDLE="secure-connect-backup.zip"
+
+          echo "${ASTRA_BUNDLE_BASE64_MAIN}" | base64 -d > "${MAIN_BUNDLE}"
+          test -s "${MAIN_BUNDLE}"
+
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            if [ -z "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_BUNDLE_BASE64_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+            if [ -z "${ASTRA_TOKEN_BACKUP:-}" ]; then
+              echo "Missing secret ASTRA_TOKEN_BACKUP while ASTRA_TARGET=backup" >&2
+              exit 1
+            fi
+          fi
+
+          if [ -n "${ASTRA_BUNDLE_BASE64_BACKUP:-}" ]; then
+            echo "${ASTRA_BUNDLE_BASE64_BACKUP}" | base64 -d > "${BACKUP_BUNDLE}"
+            test -s "${BACKUP_BUNDLE}"
+          fi
+
+          ACTIVE_BUNDLE="${MAIN_BUNDLE}"
+          ACTIVE_TOKEN="${ASTRA_TOKEN_MAIN}"
+          ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_MAIN}"
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            ACTIVE_BUNDLE="${BACKUP_BUNDLE}"
+            ACTIVE_TOKEN="${ASTRA_TOKEN_BACKUP}"
+            if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+              ACTIVE_KEYSPACE="${ASTRA_KEYSPACE_BACKUP}"
+            fi
+          fi
+
+          echo "ASTRA_BUNDLE_PATH=$PWD" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME=${ACTIVE_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_BUNDLE_NAME_BACKUP=${BACKUP_BUNDLE}" >> "$GITHUB_ENV"
+          echo "ASTRA_TOKEN=${ACTIVE_TOKEN}" >> "$GITHUB_ENV"
+          echo "ASTRA_KEYSPACE=${ACTIVE_KEYSPACE}" >> "$GITHUB_ENV"
+
+          if [ -n "${ASTRA_TOKEN_BACKUP:-}" ]; then
+            echo "ASTRA_TOKEN_BACKUP=${ASTRA_TOKEN_BACKUP}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${ASTRA_KEYSPACE_BACKUP:-}" ]; then
+            echo "ASTRA_KEYSPACE_BACKUP=${ASTRA_KEYSPACE_BACKUP}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log Astra target routing
+        run: |
+          echo "[astra-route] ASTRA_TARGET=${ASTRA_TARGET}"
+          echo "[astra-route] ASTRA_KEYSPACE=${ASTRA_KEYSPACE:-unset}"
+          echo "[astra-route] ASTRA_BUNDLE_NAME=${ASTRA_BUNDLE_NAME:-unset}"
+          if [ "${ASTRA_TARGET}" = "backup" ]; then
+            echo "[astra-route] writing to BACKUP Astra DB"
+          else
+            echo "[astra-route] writing to MAIN Astra DB"
+          fi
+
+      - name: Availability refresh (daily + intraday)
+        timeout-minutes: 24
+        env:
+          REQUEST_TIMEOUT_SEC: "30"
+          LOG_HEARTBEAT_SEC: "20"
+          AVAIL_RUN_DAILY: "1"
+          AVAIL_RUN_INTRADAY: "1"
+          IDS_SOURCE: "live"
+          AVAIL_TOP_N: "1000"
+          WIN_10M_DAYS: "7"
+          WIN_HOURLY_DAYS: "30"
+        run: |
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id FF_gck_coin_data_availability \
+            -- python prices/prod_pipeline/FF_gck_coin_data_availability.py
+
+  audits:
+    if: ${{ (github.event.inputs.run_audit || 'true') == 'true' || (github.event.inputs.run_agg_drift || 'true') == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: UTC
+      PYTHONUNBUFFERED: "1"
+      PYTHONUTF8: "1"
+      ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
       RUN_AUDIT: ${{ github.event.inputs.run_audit || 'true' }}
       RUN_AGG_DRIFT: ${{ github.event.inputs.run_agg_drift || 'true' }}
     steps:
@@ -123,23 +232,9 @@ jobs:
             echo "[astra-route] writing to MAIN Astra DB"
           fi
 
-      - name: Availability refresh (daily + intraday)
-        if: env.RUN_AVAIL == 'true'
-        env:
-          REQUEST_TIMEOUT_SEC: "30"
-          LOG_HEARTBEAT_SEC: "20"
-          AVAIL_RUN_DAILY: "1"
-          AVAIL_RUN_INTRADAY: "1"
-          IDS_SOURCE: "live"
-          WIN_10M_DAYS: "7"
-          WIN_HOURLY_DAYS: "30"
-        run: |
-          python prices/prod_pipeline/pipeline_health_runner.py \
-            --script-id FF_gck_coin_data_availability \
-            -- python prices/prod_pipeline/FF_gck_coin_data_availability.py
-
       - name: 10m gap audit (top 1000)
         if: env.RUN_AUDIT == 'true'
+        timeout-minutes: 8
         env:
           TOP_N_DQ: "1000"
           DQ_WINDOW_10M_DAYS: "7"
@@ -151,6 +246,7 @@ jobs:
 
       - name: 10m aggregate drift audit
         if: env.RUN_AGG_DRIFT == 'true'
+        timeout-minutes: 12
         env:
           TOP_N_DQ: "1000"
           DRIFT_LOOKBACK_HOURS: "36"

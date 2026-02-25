@@ -69,6 +69,7 @@ TTL_1H  = int(os.getenv("TTL_1H_COVERAGE_SEC",  str(33 * 24 * 3600)))  # ~33 day
 
 # Universe source
 IDS_SOURCE = os.getenv("IDS_SOURCE", "live").strip().lower()  # "live" | "daily"
+AVAIL_TOP_N = int(os.getenv("AVAIL_TOP_N", "0"))  # 0 = all ids from source
 AVAIL_RUN_DAILY      = os.getenv("AVAIL_RUN_DAILY", "1") == "1"       # daily ranges + summary
 AVAIL_RUN_INTRADAY   = os.getenv("AVAIL_RUN_INTRADAY", "1") == "1"    # 10m/hourly bitmaps
 
@@ -169,8 +170,17 @@ def main() -> None:
             coin_rows = exec_timed(session, bind_cl(ps_ids, []), label="DISTINCT ids from daily")
             ids_meta: Dict[str, Dict[str, Optional[str]]] = {r.id: {"symbol": None, "name": None} for r in coin_rows}
         else:
-            ps_ids = session.prepare(f"SELECT id, symbol, name FROM {TABLE_LIVE}")
+            ps_ids = session.prepare(f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}")
             coin_rows = exec_timed(session, bind_cl(ps_ids, []), label="ids from live")
+            if AVAIL_TOP_N > 0:
+                ranked_rows = []
+                for r in coin_rows:
+                    rank = getattr(r, "market_cap_rank", None)
+                    if isinstance(rank, int) and rank > 0:
+                        ranked_rows.append(r)
+                ranked_rows.sort(key=lambda r: r.market_cap_rank)
+                coin_rows = ranked_rows[:AVAIL_TOP_N]
+                log(f"Applying AVAIL_TOP_N={AVAIL_TOP_N} from live ranks: selected {len(coin_rows)} ids")
             ids_meta = {r.id: {"symbol": getattr(r, "symbol", None), "name": getattr(r, "name", None)} for r in coin_rows}
 
         coin_ids = sorted(ids_meta.keys())
