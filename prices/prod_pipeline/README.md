@@ -64,6 +64,7 @@ Data availability monitoring remains based on:
 Population path:
 
 - `FF_gck_coin_data_availability.py` refreshes all three tables (daily + intraday windows).
+- Optional parallel sharding knobs: `AVAIL_SHARD_COUNT` and `AVAIL_SHARD_INDEX` (0-based).
 - `GG_gck_dq_repair_timeseries.py` consumes these tables for targeted repair guidance.
 
 Recommended schedule:

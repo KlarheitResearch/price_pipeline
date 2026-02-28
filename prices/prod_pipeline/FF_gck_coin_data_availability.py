@@ -72,6 +72,8 @@ IDS_SOURCE = os.getenv("IDS_SOURCE", "live").strip().lower()  # "live" | "daily"
 AVAIL_TOP_N = int(os.getenv("AVAIL_TOP_N", "0"))  # 0 = all ids from source
 AVAIL_RUN_DAILY      = os.getenv("AVAIL_RUN_DAILY", "1") == "1"       # daily ranges + summary
 AVAIL_RUN_INTRADAY   = os.getenv("AVAIL_RUN_INTRADAY", "1") == "1"    # 10m/hourly bitmaps
+AVAIL_SHARD_COUNT = int(os.getenv("AVAIL_SHARD_COUNT", "1"))  # split deterministic work across parallel jobs
+AVAIL_SHARD_INDEX = int(os.getenv("AVAIL_SHARD_INDEX", "0"))  # 0-based shard index
 
 # ────────────────────────── Logging helpers ──────────────────────────
 _LOG_HEARTBEAT_SEC  = float(os.getenv("LOG_HEARTBEAT_SEC", "15"))
@@ -184,7 +186,28 @@ def main() -> None:
             ids_meta = {r.id: {"symbol": getattr(r, "symbol", None), "name": getattr(r, "name", None)} for r in coin_rows}
 
         coin_ids = sorted(ids_meta.keys())
-        log(f"Universe size: {len(coin_ids)} (source={IDS_SOURCE})  target_day={target_day} (collect={(perf_counter()-t_ids):.2f}s)")
+        total_universe = len(coin_ids)
+
+        if AVAIL_SHARD_COUNT < 1:
+            raise ValueError(f"AVAIL_SHARD_COUNT must be >= 1 (got {AVAIL_SHARD_COUNT})")
+        if AVAIL_SHARD_INDEX < 0 or AVAIL_SHARD_INDEX >= AVAIL_SHARD_COUNT:
+            raise ValueError(
+                f"AVAIL_SHARD_INDEX must be in [0, {AVAIL_SHARD_COUNT - 1}] (got {AVAIL_SHARD_INDEX})"
+            )
+
+        if AVAIL_SHARD_COUNT > 1:
+            coin_ids = [
+                cid for idx, cid in enumerate(coin_ids)
+                if (idx % AVAIL_SHARD_COUNT) == AVAIL_SHARD_INDEX
+            ]
+            ids_meta = {cid: ids_meta[cid] for cid in coin_ids}
+
+        shard_label = f"{AVAIL_SHARD_INDEX + 1}/{AVAIL_SHARD_COUNT}"
+        log(
+            f"Universe size: {len(coin_ids)} selected from {total_universe} "
+            f"(source={IDS_SOURCE}, shard={shard_label})  target_day={target_day} "
+            f"(collect={(perf_counter()-t_ids):.2f}s)"
+        )
 
         # Prepared statements
         PS_DAILY_POINT  = session.prepare(

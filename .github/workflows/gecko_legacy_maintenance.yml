@@ -30,6 +30,10 @@ concurrency:
 jobs:
   availability:
     if: ${{ (github.event.inputs.run_availability || 'true') == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        avail_shard_index: [0, 1]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -130,11 +134,14 @@ jobs:
           AVAIL_RUN_INTRADAY: "1"
           IDS_SOURCE: "live"
           AVAIL_TOP_N: "1000"
+          AVAIL_SHARD_COUNT: "2"
+          AVAIL_SHARD_INDEX: ${{ matrix.avail_shard_index }}
           WIN_10M_DAYS: "7"
           WIN_HOURLY_DAYS: "30"
         run: |
           python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id FF_gck_coin_data_availability \
+            --scope availability-shard-${{ matrix.avail_shard_index }}-of-2 \
             -- python prices/prod_pipeline/FF_gck_coin_data_availability.py
 
   audits:
