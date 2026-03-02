@@ -32,7 +32,7 @@ jobs:
   run:
     if: ${{ github.event.inputs.run_daily_partial != 'false' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       TZ: UTC
       PYTHONUNBUFFERED: "1"
@@ -133,7 +133,7 @@ jobs:
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          PROGRESS_EVERY: "20"
+          PROGRESS_EVERY: "50"
           CURRENT_ONLY: "${{ env.DAILY_CURRENT_ONLY_RESOLVED }}"
           WRITE_MCAP_DAILY: "1"
           AGG_MIN_COINS: "700"

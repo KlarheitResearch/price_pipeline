@@ -250,14 +250,14 @@ jobs:
 
       - name: EE update daily from 10m
         if: env.RUN_DAILY_10M == 'true'
-        timeout-minutes: 25
+        timeout-minutes: 35
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
           REQUEST_TIMEOUT_SEC: "40"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
-          PROGRESS_EVERY: "20"
+          PROGRESS_EVERY: "50"
           CURRENT_ONLY: "${{ env.DAILY_CURRENT_ONLY_RESOLVED }}"
           WRITE_MCAP_DAILY: "1"
           AGG_MIN_COINS: "700"
