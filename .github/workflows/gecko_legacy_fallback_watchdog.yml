@@ -1,0 +1,253 @@
+name: gecko-legacy-fallback-watchdog
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_dispatch_core:
+        description: "Force dispatch gecko_legacy_core.yml regardless of staleness checks"
+        required: false
+        default: "false"
+      force_dispatch_repair:
+        description: "Force dispatch gecko_legacy_manual_repair.yml regardless of staleness checks"
+        required: false
+        default: "false"
+      repair_lookback_hours:
+        description: "Lookback window for forced/stale manual repair dispatch"
+        required: false
+        default: "24"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: gecko-legacy-fallback-watchdog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TZ: UTC
+      CORE_WORKFLOW_FILE: gecko_legacy_core.yml
+      REPAIR_WORKFLOW_FILE: gecko_legacy_manual_repair.yml
+
+      # Trigger core catch-up when latest core workflow_dispatch run is older than this.
+      WATCHDOG_CORE_STALE_MINUTES: "90"
+      # Trigger manual 10m/hourly back-repair when outage is more severe.
+      WATCHDOG_REPAIR_TRIGGER_MINUTES: "240"
+
+      # Additional anti-spam guards.
+      WATCHDOG_CORE_COOLDOWN_MINUTES: "60"
+      WATCHDOG_REPAIR_COOLDOWN_MINUTES: "360"
+
+      # Default repair payload.
+      WATCHDOG_REPAIR_RANK_START: "1"
+      WATCHDOG_REPAIR_RANK_END: "1000"
+      WATCHDOG_REPAIR_GRANULARITY: "both"
+      # Overwrite is required to replace stale carry-forward rows that already exist.
+      WATCHDOG_REPAIR_OVERWRITE_EXISTING: "true"
+      WATCHDOG_REPAIR_DRY_RUN: "false"
+      WATCHDOG_REPAIR_LOOKBACK_HOURS: "24"
+
+    steps:
+      - name: Check staleness and dispatch catch-up if needed
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = context.ref.replace("refs/heads/", "");
+
+            const coreWorkflow = process.env.CORE_WORKFLOW_FILE;
+            const repairWorkflow = process.env.REPAIR_WORKFLOW_FILE;
+
+            const toInt = (raw, fallback, min = 1, max = 1_000_000) => {
+              const n = Number(raw);
+              if (!Number.isFinite(n)) return fallback;
+              const i = Math.trunc(n);
+              if (i < min || i > max) return fallback;
+              return i;
+            };
+            const boolFrom = (raw) => String(raw || "").trim().toLowerCase() === "true";
+            const now = new Date();
+            const nowMs = now.getTime();
+
+            const coreStaleMinutes = toInt(process.env.WATCHDOG_CORE_STALE_MINUTES, 90, 10, 24 * 60);
+            const repairTriggerMinutes = toInt(
+              process.env.WATCHDOG_REPAIR_TRIGGER_MINUTES,
+              240,
+              30,
+              7 * 24 * 60
+            );
+            const coreCooldownMinutes = toInt(process.env.WATCHDOG_CORE_COOLDOWN_MINUTES, 60, 10, 24 * 60);
+            const repairCooldownMinutes = toInt(
+              process.env.WATCHDOG_REPAIR_COOLDOWN_MINUTES,
+              360,
+              30,
+              14 * 24 * 60
+            );
+
+            const forcedCore = boolFrom(context.payload?.inputs?.force_dispatch_core);
+            const forcedRepair = boolFrom(context.payload?.inputs?.force_dispatch_repair);
+            const manualLookbackHours = toInt(
+              context.payload?.inputs?.repair_lookback_hours || process.env.WATCHDOG_REPAIR_LOOKBACK_HOURS,
+              24,
+              1,
+              24 * 7
+            );
+
+            async function listDispatchRuns(workflowFile, perPage = 20) {
+              const resp = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: workflowFile,
+                event: "workflow_dispatch",
+                branch: ref,
+                per_page: Math.max(1, Math.min(100, perPage)),
+              });
+              return Array.isArray(resp.data.workflow_runs) ? resp.data.workflow_runs : [];
+            }
+
+            async function inProgress(workflowFile) {
+              const runs = await listDispatchRuns(workflowFile, 20);
+              return runs.some((run) => {
+                const s = String(run.status || "").toLowerCase();
+                return s === "queued" || s === "in_progress" || s === "waiting" || s === "requested";
+              });
+            }
+
+            async function newestDispatchAgeMinutes(workflowFile) {
+              const runs = await listDispatchRuns(workflowFile, 20);
+              const first = runs[0];
+              if (!first?.created_at) return null;
+              const createdMs = Date.parse(first.created_at);
+              if (!Number.isFinite(createdMs)) return null;
+              return Math.max(0, (nowMs - createdMs) / 60_000);
+            }
+
+            async function hasRecentDispatch(workflowFile, cooldownMinutes) {
+              const runs = await listDispatchRuns(workflowFile, 20);
+              const cutoff = nowMs - cooldownMinutes * 60_000;
+              return runs.some((run) => {
+                const createdMs = Date.parse(String(run.created_at || ""));
+                return Number.isFinite(createdMs) && createdMs >= cutoff;
+              });
+            }
+
+            function repairInputs(lookbackHours) {
+              const fromUtc = new Date(nowMs - lookbackHours * 3_600_000).toISOString();
+              const toUtc = now.toISOString();
+              const rankStart = String(toInt(process.env.WATCHDOG_REPAIR_RANK_START, 1, 1, 250_000));
+              const rankEnd = String(toInt(process.env.WATCHDOG_REPAIR_RANK_END, 1000, 1, 250_000));
+              const granularityRaw = String(process.env.WATCHDOG_REPAIR_GRANULARITY || "both").toLowerCase();
+              const granularity =
+                granularityRaw === "10m" || granularityRaw === "hourly" || granularityRaw === "both"
+                  ? granularityRaw
+                  : "both";
+
+              return {
+                rank_start: rankStart,
+                rank_end: rankEnd,
+                coin_ids: "",
+                from_utc: fromUtc,
+                to_utc: toUtc,
+                granularity,
+                overwrite_existing: String(process.env.WATCHDOG_REPAIR_OVERWRITE_EXISTING || "false").toLowerCase() === "true" ? "true" : "false",
+                dry_run: String(process.env.WATCHDOG_REPAIR_DRY_RUN || "false").toLowerCase() === "true" ? "true" : "false",
+              };
+            }
+
+            const coreAgeMinutes = await newestDispatchAgeMinutes(coreWorkflow);
+            const coreRunInProgress = await inProgress(coreWorkflow);
+
+            const shouldDispatchCoreByStale = coreAgeMinutes == null || coreAgeMinutes >= coreStaleMinutes;
+            const coreRecentlyDispatched = await hasRecentDispatch(coreWorkflow, coreCooldownMinutes);
+            const shouldDispatchCore =
+              (forcedCore || shouldDispatchCoreByStale) &&
+              !coreRunInProgress &&
+              !coreRecentlyDispatched;
+
+            let coreDispatch = "skipped";
+            if (shouldDispatchCore) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: coreWorkflow,
+                ref,
+                inputs: {
+                  run_live: "true",
+                  run_10m: "true",
+                  run_hourly: "true",
+                  run_daily_from_10m: "false",
+                  run_monthly: "false",
+                  TOP_N: "1000",
+                  RANK_TOP_N: "1000",
+                  CURRENT_ONLY: "1",
+                  DAILY_CURRENT_ONLY: "1",
+                  MONTHLY_CURRENT_ONLY: "1",
+                  VERBOSE_MODE: "0",
+                },
+              });
+              coreDispatch = "dispatched";
+            }
+
+            const severeStale = coreAgeMinutes == null || coreAgeMinutes >= repairTriggerMinutes;
+            const repairRunInProgress = await inProgress(repairWorkflow);
+            const repairRecentlyDispatched = await hasRecentDispatch(repairWorkflow, repairCooldownMinutes);
+            const shouldDispatchRepair =
+              (forcedRepair || severeStale) &&
+              !repairRunInProgress &&
+              !repairRecentlyDispatched;
+
+            let repairDispatch = "skipped";
+            let repairPayload = null;
+            if (shouldDispatchRepair) {
+              repairPayload = repairInputs(manualLookbackHours);
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: repairWorkflow,
+                ref,
+                inputs: repairPayload,
+              });
+              repairDispatch = "dispatched";
+            }
+
+            const summary = {
+              owner,
+              repo,
+              ref,
+              coreWorkflow,
+              repairWorkflow,
+              coreAgeMinutes: coreAgeMinutes == null ? null : Math.round(coreAgeMinutes),
+              thresholds: {
+                coreStaleMinutes,
+                repairTriggerMinutes,
+                coreCooldownMinutes,
+                repairCooldownMinutes,
+              },
+              forced: {
+                core: forcedCore,
+                repair: forcedRepair,
+              },
+              core: {
+                runInProgress: coreRunInProgress,
+                recentlyDispatched: coreRecentlyDispatched,
+                action: coreDispatch,
+              },
+              repair: {
+                runInProgress: repairRunInProgress,
+                recentlyDispatched: repairRecentlyDispatched,
+                action: repairDispatch,
+                payload: repairPayload,
+              },
+            };
+
+            core.info(JSON.stringify(summary, null, 2));
+            core.summary.addCodeBlock(JSON.stringify(summary, null, 2), "json");
+            await core.summary.write();

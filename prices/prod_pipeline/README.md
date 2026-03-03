@@ -119,6 +119,33 @@ If you want cleaner scheduling (fewer skipped workflow runs), deploy these worke
 - `backend/prices/prod_pipeline/cloudflare/legacy-core-5m.js`
 - `backend/prices/prod_pipeline/cloudflare/legacy-maintenance-daily.js`
 
+### Core worker outage watchdog
+
+`legacy-core-5m.js` now includes a stale-data watchdog that can auto-dispatch
+`gecko_legacy_manual_repair.yml` when both 10m and hourly datasets are severely stale
+(for example after scheduler downtime overnight).
+
+Recommended worker env:
+
+- `WATCHDOG_ENABLED=1`
+- `WATCHDOG_STATUS_URL=https://<your-frontend-domain>/api/status/summary`
+- `WATCHDOG_CHECK_EVERY_MINUTES=30`
+- `WATCHDOG_10M_TRIGGER_MINUTES=180`
+- `WATCHDOG_HOURLY_TRIGGER_MINUTES=360`
+- `WATCHDOG_REPAIR_COOLDOWN_MINUTES=360`
+- `WATCHDOG_REPAIR_LOOKBACK_HOURS=18`
+- `WATCHDOG_REPAIR_RANK_START=1`
+- `WATCHDOG_REPAIR_RANK_END=1000`
+- `WATCHDOG_REPAIR_GRANULARITY=both`
+- `WATCHDOG_REPAIR_DRY_RUN=false`
+- `WATCHDOG_REPAIR_OVERWRITE=true`
+- `WATCHDOG_REPAIR_COIN_IDS=` (optional CSV subset)
+
+Notes:
+
+- The watchdog is additive; normal 5m/10m dispatch cadence is unchanged.
+- Repair dispatch is guarded by in-progress check + cooldown to avoid run spam.
+
 ## Required env/secrets
 
 - Local/runtime env:

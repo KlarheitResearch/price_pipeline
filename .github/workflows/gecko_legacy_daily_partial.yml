@@ -7,12 +7,20 @@ on:
         description: "Run EE_gck_create_daily_from_10m.py"
         required: false
         default: "true"
+      run_monthly_partial:
+        description: "Run EG_gck_update_monthly_from_daily.py"
+        required: false
+        default: "true"
       TOP_N:
         description: "Override TOP_N"
         required: false
         default: "1000"
       DAILY_CURRENT_ONLY:
         description: "Only update current partial day from 10m/live (0/1)"
+        required: false
+        default: "1"
+      MONTHLY_CURRENT_ONLY:
+        description: "Monthly: only update current partial month (0/1)"
         required: false
         default: "1"
       VERBOSE_MODE:
@@ -38,8 +46,10 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      RUN_MONTHLY_PARTIAL: ${{ github.event.inputs.run_monthly_partial || 'true' }}
       TOP_N_RESOLVED: ${{ github.event.inputs.TOP_N || '1000' }}
       DAILY_CURRENT_ONLY_RESOLVED: ${{ github.event.inputs.DAILY_CURRENT_ONLY || '1' }}
+      MONTHLY_CURRENT_ONLY_RESOLVED: ${{ github.event.inputs.MONTHLY_CURRENT_ONLY || '1' }}
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
 
     steps:
@@ -143,3 +153,18 @@ jobs:
           python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id EE_gck_create_daily_from_10m \
             -- python prices/prod_pipeline/EE_gck_create_daily_from_10m.py
+
+      - name: EG update monthly from daily
+        if: env.RUN_MONTHLY_PARTIAL == 'true'
+        timeout-minutes: 10
+        env:
+          TOP_N: "${{ env.TOP_N_RESOLVED }}"
+          REQUEST_TIMEOUT_SEC: "40"
+          CONNECT_TIMEOUT_SEC: "15"
+          FETCH_SIZE: "500"
+          CURRENT_ONLY: "${{ env.MONTHLY_CURRENT_ONLY_RESOLVED }}"
+          VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
+        run: |
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id EG_gck_update_monthly_from_daily \
+            -- python prices/prod_pipeline/EG_gck_update_monthly_from_daily.py
