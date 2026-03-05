@@ -182,7 +182,7 @@ jobs:
                 inputs: {
                   run_live: "true",
                   run_10m: "true",
-                  run_hourly: "true",
+                  run_hourly: "false",
                   run_daily_from_10m: "false",
                   run_monthly: "false",
                   TOP_N: "1000",

@@ -25,10 +25,12 @@ The former paid-tier prod implementation has been moved to `backend/prices/poten
 
 Active workflow set is intentionally small:
 
-- `gecko_legacy_core.yml`: main 10m cycle for AA + CC + DD.
+- `gecko_legacy_core.yml`: main 10m cycle for AA + CC (live + 10m append).
+- `gecko_legacy_hourly.yml`: dedicated DD hourly build/finalize cadence.
 - `gecko_legacy_daily_partial.yml`: dedicated EE updates from 10m/live (frequent partial updates + nightly full finalize).
 - `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
 - `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit + 10m aggregate drift audit.
+- `gecko_legacy_anchor_heal.yml`: stale-aware API healing for anchor assets (`bitcoin,ethereum,solana`) via `HE_gck_heal_anchor_if_stale.py`.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
 
 All workflow script steps run through:
@@ -52,6 +54,7 @@ Legacy script IDs written to health tables:
 - `audit_10m_gaps`
 - `audit_10m_aggregate_drift`
 - `GM_gck_manual_repair_intraday`
+- `HE_gck_heal_anchor_if_stale`
 
 ### Coverage and availability tables
 
