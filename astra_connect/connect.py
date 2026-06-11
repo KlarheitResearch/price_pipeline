@@ -176,8 +176,8 @@ class AstraConfig:
     bundle_path: str
     token: str
     keyspace: str
-    request_timeout_sec: int = 60
-    connect_timeout_sec: int = 15
+    request_timeout_sec: int = 90
+    connect_timeout_sec: int = 60
     fetch_size: int = 1000
 
     @staticmethod
