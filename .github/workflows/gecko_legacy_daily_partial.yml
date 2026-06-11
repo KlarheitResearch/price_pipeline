@@ -139,8 +139,8 @@ jobs:
       - name: EE update daily from 10m
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "60"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "50"
