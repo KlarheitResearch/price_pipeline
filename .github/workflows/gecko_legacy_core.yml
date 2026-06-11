@@ -179,9 +179,9 @@ jobs:
           REQUIRED_LIVE_MIN: "700"
           RETRIES: "3"
           CG_BACKOFF_BASE_S: "5"
-          REQUEST_TIMEOUT_SEC: "60"
-          CONNECT_TIMEOUT_SEC: "15"
-          BATCH_FLUSH_EVERY: "50"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "90"
+          BATCH_FLUSH_EVERY: "60"
           RANK_BUCKET: "all"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
         run: |
@@ -194,8 +194,8 @@ jobs:
         timeout-minutes: 12
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "60"
-          CONNECT_TIMEOUT_SEC: "15"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "60"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           SLOTS_BACKFILL: "4"
@@ -232,8 +232,8 @@ jobs:
         timeout-minutes: 20
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "60"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           CURRENT_ONLY: "${{ env.CURRENT_ONLY_RESOLVED }}"
@@ -253,8 +253,8 @@ jobs:
         timeout-minutes: 35
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "60"
           FETCH_SIZE: "500"
           SLOT_DELAY_SEC: "120"
           PROGRESS_EVERY: "50"
@@ -273,8 +273,8 @@ jobs:
         timeout-minutes: 8
         env:
           TOP_N: "${{ env.TOP_N_RESOLVED }}"
-          REQUEST_TIMEOUT_SEC: "40"
-          CONNECT_TIMEOUT_SEC: "15"
+          REQUEST_TIMEOUT_SEC: "90"
+          CONNECT_TIMEOUT_SEC: "60"
           FETCH_SIZE: "500"
           CURRENT_ONLY: "${{ env.MONTHLY_CURRENT_ONLY_RESOLVED }}"
           VERBOSE_MODE: "${{ env.VERBOSE_RESOLVED }}"
