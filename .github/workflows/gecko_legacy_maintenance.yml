@@ -10,7 +10,7 @@ on:
       run_precise_repair:
         description: "Run GM_gck_manual_repair_intraday.py for top ranks only"
         required: false
-        default: "true"
+        default: "false"
       run_live_refresh:
         description: "Run GI_gck_refresh_live_from_raw.py"
         required: false
@@ -47,10 +47,14 @@ on:
         description: "Precise API repair rank end"
         required: false
         default: "100"
-      precise_repair_lookback_hours:
-        description: "Precise API repair lookback window in hours"
+      precise_10m_lookback_hours:
+        description: "Precise 10m API repair lookback window in hours"
         required: false
         default: "24"
+      precise_hourly_lookback_hours:
+        description: "Precise hourly API repair lookback window in hours"
+        required: false
+        default: "168"
       precise_replace_derived:
         description: "Replace bf_* derived slots during precise repair"
         required: false
@@ -81,7 +85,8 @@ jobs:
       CONTINUITY_RANK_END: ${{ github.event.inputs.continuity_rank_end || '1000' }}
       CONTINUITY_LOOKBACK_HOURS: ${{ github.event.inputs.continuity_lookback_hours || '72' }}
       PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
-      PRECISE_REPAIR_LOOKBACK_HOURS: ${{ github.event.inputs.precise_repair_lookback_hours || '24' }}
+      PRECISE_10M_LOOKBACK_HOURS: ${{ github.event.inputs.precise_10m_lookback_hours || '24' }}
+      PRECISE_HOURLY_LOOKBACK_HOURS: ${{ github.event.inputs.precise_hourly_lookback_hours || '168' }}
       PRECISE_REPLACE_DERIVED: ${{ github.event.inputs.precise_replace_derived || 'true' }}
     steps:
       - uses: actions/checkout@v4
@@ -184,7 +189,42 @@ jobs:
               --from-utc "${FROM_UTC}" \
               --to-utc "${TO_UTC}"
 
-      - name: Precise API repair (top ranks only)
+      - name: Precise API repair 10m (top ranks, recent only)
+        if: ${{ (github.event.inputs.run_precise_repair || 'true') == 'true' }}
+        timeout-minutes: 45
+        env:
+          COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
+          COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
+          COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
+          REQUEST_TIMEOUT_SEC: "45"
+          FETCH_SIZE: "500"
+          CG_CHUNK_HOURS: "72"
+          PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
+          AUTHORITATIVE_10M_MAX_HOURS: ${{ github.event.inputs.precise_10m_lookback_hours || '24' }}
+        run: |
+          set -euo pipefail
+          TO_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          FROM_UTC="$(date -u -d "${PRECISE_10M_LOOKBACK_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
+
+          CMD=(python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id GM_gck_manual_repair_intraday_10m \
+            --rank-start "1" \
+            --rank-end "${PRECISE_RANK_END}" \
+            -- python prices/prod_pipeline/GM_gck_manual_repair_intraday.py \
+            --rank-start "1" \
+            --rank-end "${PRECISE_RANK_END}" \
+            --from-utc "${FROM_UTC}" \
+            --to-utc "${TO_UTC}" \
+            --granularity "10m" \
+            --precise-rank-end "${PRECISE_RANK_END}")
+
+          if [ "${PRECISE_REPLACE_DERIVED}" = "true" ]; then
+            CMD+=(--replace-derived)
+          fi
+
+          "${CMD[@]}"
+
+      - name: Precise API repair hourly (top ranks, outage recovery)
         if: ${{ (github.event.inputs.run_precise_repair || 'true') == 'true' }}
         timeout-minutes: 60
         env:
@@ -195,29 +235,23 @@ jobs:
           FETCH_SIZE: "500"
           CG_CHUNK_HOURS: "72"
           PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
-          AUTHORITATIVE_10M_MAX_HOURS: ${{ github.event.inputs.precise_repair_lookback_hours || '24' }}
         run: |
           set -euo pipefail
           TO_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          FROM_UTC="$(date -u -d "${PRECISE_REPAIR_LOOKBACK_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
+          FROM_UTC="$(date -u -d "${PRECISE_HOURLY_LOOKBACK_HOURS} hours ago" +%Y-%m-%dT%H:%M:%SZ)"
 
-          CMD=(python prices/prod_pipeline/pipeline_health_runner.py \
-            --script-id GM_gck_manual_repair_intraday \
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id GM_gck_manual_repair_intraday_hourly \
             --rank-start "1" \
             --rank-end "${PRECISE_RANK_END}" \
             -- python prices/prod_pipeline/GM_gck_manual_repair_intraday.py \
-            --rank-start "1" \
-            --rank-end "${PRECISE_RANK_END}" \
-            --from-utc "${FROM_UTC}" \
-            --to-utc "${TO_UTC}" \
-            --granularity "both" \
-            --precise-rank-end "${PRECISE_RANK_END}")
-
-          if [ "${PRECISE_REPLACE_DERIVED}" = "true" ]; then
-            CMD+=(--replace-derived)
-          fi
-
-          "${CMD[@]}"
+              --rank-start "1" \
+              --rank-end "${PRECISE_RANK_END}" \
+              --from-utc "${FROM_UTC}" \
+              --to-utc "${TO_UTC}" \
+              --granularity "hourly" \
+              --precise-rank-end "${PRECISE_RANK_END}" \
+              --overwrite-existing
 
       - name: Refresh live tables from raw continuity
         if: ${{ (github.event.inputs.run_live_refresh || 'true') == 'true' }}

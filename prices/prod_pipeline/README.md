@@ -31,9 +31,10 @@ Active workflow set is intentionally small:
 - `gecko_legacy_hourly.yml`: dedicated DD hourly build/finalize cadence.
 - `gecko_legacy_daily_partial.yml`: dedicated EE updates from 10m/live (frequent partial updates + nightly full finalize).
 - `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
-- `gecko_legacy_maintenance.yml`: continuity-first maintenance for raw/live/aggregate recovery plus availability and audit checks.
+- `gecko_legacy_maintenance.yml`: continuity-first daily maintenance for raw/live/aggregate recovery plus availability and audit checks. Precise API repair is disabled by default here.
 - `gecko_legacy_anchor_heal.yml`: stale-aware API healing for anchor assets (`bitcoin,ethereum,solana`) via `HE_gck_heal_anchor_if_stale.py`.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
+- `gecko_legacy_outage_repair.yml`: one-time long-outage recovery workflow for top-rank precise repair plus continuity/live/aggregate rebuild.
 
 All workflow script steps run through:
 
@@ -133,9 +134,11 @@ GitHub Actions manual dispatch:
 Daily maintenance is now tiered:
 
 - Top `1-1000`: keep continuity locally with `GF_gck_backfill_raw_flat.py`.
-- Top `1-100`: spend API credits only on exact missing or `bf_*` derived intraday slots in a recent window.
+- Top `1-100`: precise API repair is available, but should normally stay off in the scheduled daily maintenance run.
 - Lower ranks: accept flat/carry-forward continuity instead of precise intraday API backfill.
 - After continuity/repair, rebuild `gecko_prices_live`, `gecko_prices_live_ranked`, `gecko_market_cap_live`, and the aggregate market-cap tables from local raw data.
+
+For unusual long outages, use `gecko_legacy_outage_repair.yml` instead of changing the daily scheduler behavior. That workflow is intended for manual, one-off repair windows such as multi-day GitHub Actions downtime or vacation gaps.
 
 ## Optional Cloudflare dispatch scripts
 
@@ -147,14 +150,15 @@ If you want cleaner scheduling (fewer skipped workflow runs), deploy these worke
 Recommended maintenance worker env:
 
 - `RUN_CONTINUITY_BACKFILL=true`
-- `RUN_PRECISE_REPAIR=true`
+- `RUN_PRECISE_REPAIR=false`
 - `RUN_LIVE_REFRESH=true`
 - `RUN_MCAP_REBUILD=true`
 - `CONTINUITY_RANK_START=1`
 - `CONTINUITY_RANK_END=1000`
 - `CONTINUITY_LOOKBACK_HOURS=72`
 - `PRECISE_RANK_END=100`
-- `PRECISE_REPAIR_LOOKBACK_HOURS=24`
+- `PRECISE_10M_LOOKBACK_HOURS=24`
+- `PRECISE_HOURLY_LOOKBACK_HOURS=168`
 - `PRECISE_REPLACE_DERIVED=true`
 
 ### Core worker outage watchdog
