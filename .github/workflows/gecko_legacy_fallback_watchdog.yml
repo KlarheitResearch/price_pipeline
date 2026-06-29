@@ -43,6 +43,10 @@ jobs:
       # Additional anti-spam guards.
       WATCHDOG_CORE_COOLDOWN_MINUTES: "60"
       WATCHDOG_REPAIR_COOLDOWN_MINUTES: "360"
+      WATCHDOG_BLOCKING_RUN_MAX_AGE_MINUTES: "180"
+
+      # Full manual repair is CoinGecko-expensive; keep it opt-in.
+      WATCHDOG_REPAIR_ENABLED: "0"
 
       # Default repair payload.
       WATCHDOG_REPAIR_RANK_START: "1"
@@ -91,9 +95,16 @@ jobs:
               30,
               14 * 24 * 60
             );
+            const blockingRunMaxAgeMinutes = toInt(
+              process.env.WATCHDOG_BLOCKING_RUN_MAX_AGE_MINUTES,
+              180,
+              5,
+              7 * 24 * 60
+            );
 
             const forcedCore = boolFrom(context.payload?.inputs?.force_dispatch_core);
             const forcedRepair = boolFrom(context.payload?.inputs?.force_dispatch_repair);
+            const repairDispatchEnabled = boolFrom(process.env.WATCHDOG_REPAIR_ENABLED);
             const manualLookbackHours = toInt(
               context.payload?.inputs?.repair_lookback_hours || process.env.WATCHDOG_REPAIR_LOOKBACK_HOURS,
               24,
@@ -117,7 +128,15 @@ jobs:
               const runs = await listDispatchRuns(workflowFile, 20);
               return runs.some((run) => {
                 const s = String(run.status || "").toLowerCase();
-                return s === "queued" || s === "in_progress" || s === "waiting" || s === "requested";
+                if (!(s === "queued" || s === "in_progress" || s === "waiting" || s === "requested")) {
+                  return false;
+                }
+                const createdMs = Date.parse(String(run.created_at || ""));
+                if (!Number.isFinite(createdMs)) {
+                  return true;
+                }
+                const ageMinutes = Math.max(0, (nowMs - createdMs) / 60_000);
+                return ageMinutes <= blockingRunMaxAgeMinutes;
               });
             }
 
@@ -200,7 +219,7 @@ jobs:
             const repairRunInProgress = await inProgress(repairWorkflow);
             const repairRecentlyDispatched = await hasRecentDispatch(repairWorkflow, repairCooldownMinutes);
             const shouldDispatchRepair =
-              (forcedRepair || severeStale) &&
+              (forcedRepair || (repairDispatchEnabled && severeStale)) &&
               !repairRunInProgress &&
               !repairRecentlyDispatched;
 
@@ -230,11 +249,13 @@ jobs:
                 repairTriggerMinutes,
                 coreCooldownMinutes,
                 repairCooldownMinutes,
+                blockingRunMaxAgeMinutes,
               },
               forced: {
                 core: forcedCore,
                 repair: forcedRepair,
               },
+              repairDispatchEnabled,
               core: {
                 runInProgress: coreRunInProgress,
                 recentlyDispatched: coreRecentlyDispatched,

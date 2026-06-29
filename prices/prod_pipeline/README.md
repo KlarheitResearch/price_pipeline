@@ -131,6 +131,7 @@ If you want cleaner scheduling (fewer skipped workflow runs), deploy these worke
 Recommended worker env:
 
 - `WATCHDOG_ENABLED=1`
+- `WATCHDOG_REPAIR_ENABLED=0`
 - `WATCHDOG_STATUS_URL=https://<your-frontend-domain>/api/status/summary`
 - `WATCHDOG_CHECK_EVERY_MINUTES=30`
 - `WATCHDOG_10M_TRIGGER_MINUTES=180`
@@ -147,6 +148,7 @@ Recommended worker env:
 Notes:
 
 - The watchdog is additive; normal 5m/10m dispatch cadence is unchanged.
+- Full manual repair dispatch is intentionally disabled by default because it can consume thousands of CoinGecko credits per day.
 - Repair dispatch is guarded by in-progress check + cooldown to avoid run spam.
 
 ## Required env/secrets

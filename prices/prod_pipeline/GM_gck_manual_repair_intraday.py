@@ -252,6 +252,12 @@ def main() -> None:
     )
     if do_10m and (end_dt - start_dt) > timedelta(days=7):
         print(f"[{now_str()}] WARN: 10m table is typically 7d-scoped; range exceeds 7 days.")
+    if do_10m and (end_dt - start_dt) > timedelta(days=1):
+        print(
+            f"[{now_str()}] WARN: CoinGecko market_chart/range auto-granularity is hourly for "
+            f"windows beyond 1 day, so multi-day 10m repair will be sparse/non-authoritative. "
+            f"Use this mainly for hourly repair, or limit 10m repair to the most recent <=24h window."
+        )
 
     print(f"[{now_str()}] Connecting to Astra...")
     session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
