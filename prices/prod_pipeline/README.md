@@ -11,6 +11,8 @@ The former paid-tier prod implementation has been moved to `backend/prices/poten
 - Daily candles: `EE_gck_create_daily_from_10m.py` (from 10m, no CoinGecko).
 - Monthly candles: `EG_gck_update_monthly_from_daily.py` (from daily/live, no CoinGecko).
 - True daily close API enrichment: `EF_gck_close_daily_topn_api.py` (default rank 1-300), once daily.
+- Continuity/raw backfill: `GF_gck_backfill_raw_flat.py` (local-only carry/derive fill across 10m/hourly/daily/monthly).
+- Live recovery from raw: `GI_gck_refresh_live_from_raw.py` (rebuilds live-facing tables from freshest local raw rows, no CoinGecko).
 - API-key handling for all CoinGecko callers is centralized in `cg_key_pool.py` (AA/BB/CC/DD rotation + cooldown/suspension).
 
 ## Defaults changed
@@ -29,7 +31,7 @@ Active workflow set is intentionally small:
 - `gecko_legacy_hourly.yml`: dedicated DD hourly build/finalize cadence.
 - `gecko_legacy_daily_partial.yml`: dedicated EE updates from 10m/live (frequent partial updates + nightly full finalize).
 - `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
-- `gecko_legacy_maintenance.yml`: availability refresh + 10m gap audit + 10m aggregate drift audit.
+- `gecko_legacy_maintenance.yml`: continuity-first maintenance for raw/live/aggregate recovery plus availability and audit checks.
 - `gecko_legacy_anchor_heal.yml`: stale-aware API healing for anchor assets (`bitcoin,ethereum,solana`) via `HE_gck_heal_anchor_if_stale.py`.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
 
@@ -51,6 +53,9 @@ Legacy script IDs written to health tables:
 - `EG_gck_update_monthly_from_daily`
 - `EF_gck_close_daily_topn_api`
 - `FF_gck_coin_data_availability`
+- `GF_gck_backfill_raw_flat`
+- `GI_gck_refresh_live_from_raw`
+- `HH_recalculate_mcaps`
 - `audit_10m_gaps`
 - `audit_10m_aggregate_drift`
 - `GM_gck_manual_repair_intraday`
@@ -74,6 +79,8 @@ Recommended schedule:
 
 - Run `gecko_legacy_maintenance.yml` daily after the API daily close workflow.
 - Keep maintenance independent from 10m runtime cadence to avoid contention.
+- Prefer continuity + local rebuild over broad API repair.
+- Keep precise CoinGecko repair constrained to recent windows and top ranks unless you explicitly override it.
 
 CC runtime tuning knobs (for timeout control):
 
@@ -96,6 +103,12 @@ Original prod-era workflow files are archived (not active) at:
 Use `GM_gck_manual_repair_intraday.py` for on-demand 10m/hourly repairs by rank range and UTC time window.
 You can optionally narrow to explicit coin ids.
 
+Default safety behavior:
+
+- API repair is capped to ranks `1-100` unless `--allow-broad-ranks` is set.
+- 10m API repair auto-disables when the selected window exceeds `24h`.
+- Existing `bf_*` carry/derived rows can be replaced with `--replace-derived`.
+
 Local example:
 
 ```bash
@@ -115,12 +128,34 @@ GitHub Actions manual dispatch:
 - Workflow: `gecko-legacy-manual-repair` (`backend/.github/workflows/gecko_legacy_manual_repair.yml`).
 - Inputs: rank window, optional coin ids, UTC range, granularity, overwrite mode, dry-run mode.
 
+## Maintenance strategy
+
+Daily maintenance is now tiered:
+
+- Top `1-1000`: keep continuity locally with `GF_gck_backfill_raw_flat.py`.
+- Top `1-100`: spend API credits only on exact missing or `bf_*` derived intraday slots in a recent window.
+- Lower ranks: accept flat/carry-forward continuity instead of precise intraday API backfill.
+- After continuity/repair, rebuild `gecko_prices_live`, `gecko_prices_live_ranked`, `gecko_market_cap_live`, and the aggregate market-cap tables from local raw data.
+
 ## Optional Cloudflare dispatch scripts
 
 If you want cleaner scheduling (fewer skipped workflow runs), deploy these worker scripts instead of the prod dispatch set:
 
 - `backend/prices/prod_pipeline/cloudflare/legacy-core-5m.js`
 - `backend/prices/prod_pipeline/cloudflare/legacy-maintenance-daily.js`
+
+Recommended maintenance worker env:
+
+- `RUN_CONTINUITY_BACKFILL=true`
+- `RUN_PRECISE_REPAIR=true`
+- `RUN_LIVE_REFRESH=true`
+- `RUN_MCAP_REBUILD=true`
+- `CONTINUITY_RANK_START=1`
+- `CONTINUITY_RANK_END=1000`
+- `CONTINUITY_LOOKBACK_HOURS=72`
+- `PRECISE_RANK_END=100`
+- `PRECISE_REPAIR_LOOKBACK_HOURS=24`
+- `PRECISE_REPLACE_DERIVED=true`
 
 ### Core worker outage watchdog
 

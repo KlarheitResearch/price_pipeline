@@ -3,6 +3,7 @@ import os
 import pathlib
 import sys
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
@@ -179,6 +180,9 @@ class AstraConfig:
     request_timeout_sec: int = 90
     connect_timeout_sec: int = 60
     fetch_size: int = 1000
+    connect_attempts: int = 3
+    connect_retry_base_sec: float = 5.0
+    connect_retry_max_sec: float = 20.0
 
     @staticmethod
     def from_env(
@@ -204,9 +208,12 @@ class AstraConfig:
         )
         bundle_path = _resolve_bundle_path(target=resolved_target, env_root=env_root)
 
-        req = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
-        conn = int(os.getenv("CONNECT_TIMEOUT_SEC", "15"))
+        req = int(os.getenv("REQUEST_TIMEOUT_SEC", "90"))
+        conn = int(os.getenv("CONNECT_TIMEOUT_SEC", "60"))
         fetch_size = int(os.getenv("FETCH_SIZE", "1000"))
+        connect_attempts = max(1, int(os.getenv("ASTRA_CONNECT_ATTEMPTS", "3")))
+        connect_retry_base_sec = max(0.0, float(os.getenv("ASTRA_CONNECT_RETRY_BASE_SEC", "5")))
+        connect_retry_max_sec = max(connect_retry_base_sec, float(os.getenv("ASTRA_CONNECT_RETRY_MAX_SEC", "20")))
 
         errors = []
         if not token:
@@ -237,6 +244,9 @@ class AstraConfig:
             request_timeout_sec=req,
             connect_timeout_sec=conn,
             fetch_size=fetch_size,
+            connect_attempts=connect_attempts,
+            connect_retry_base_sec=connect_retry_base_sec,
+            connect_retry_max_sec=connect_retry_max_sec,
         )
 
 
@@ -253,6 +263,22 @@ def _cluster_cache_key(cfg: AstraConfig) -> ClusterCacheKey:
         cfg.request_timeout_sec,
         cfg.connect_timeout_sec,
     )
+
+
+def _evict_cached_cluster(cfg: AstraConfig) -> Optional[Tuple[Cluster, ExecutionProfile]]:
+    key = _cluster_cache_key(cfg)
+    with _cluster_cache_lock:
+        return _cluster_cache.pop(key, None)
+
+
+def _shutdown_cluster_item(item: Optional[Tuple[Cluster, ExecutionProfile]]) -> None:
+    if item is None:
+        return
+    cluster, _profile = item
+    try:
+        cluster.shutdown()
+    except Exception:
+        pass
 
 
 def _get_cluster_and_profile(cfg: AstraConfig) -> Tuple[Cluster, ExecutionProfile]:
@@ -308,14 +334,46 @@ def get_session(
     )
     if keyspace:
         cfg = replace(cfg, keyspace=keyspace)
+    last_exc: Optional[Exception] = None
 
-    cluster, _ = _get_cluster_and_profile(cfg)
-    session = cluster.connect(cfg.keyspace)
-    session.default_fetch_size = cfg.fetch_size
+    for attempt in range(1, cfg.connect_attempts + 1):
+        cluster: Optional[Cluster] = None
+        try:
+            cluster, _ = _get_cluster_and_profile(cfg)
+            session = cluster.connect(cfg.keyspace)
+            session.default_fetch_size = cfg.fetch_size
 
-    if return_cluster:
-        return session, cluster
-    return session
+            if return_cluster:
+                return session, cluster
+            return session
+        except Exception as exc:
+            last_exc = exc
+            cached_item = _evict_cached_cluster(cfg)
+            if cached_item is not None:
+                _shutdown_cluster_item(cached_item)
+            elif cluster is not None:
+                try:
+                    cluster.shutdown()
+                except Exception:
+                    pass
+
+            if attempt >= cfg.connect_attempts:
+                break
+
+            delay = min(
+                cfg.connect_retry_max_sec,
+                cfg.connect_retry_base_sec * (2 ** (attempt - 1)),
+            )
+            print(
+                "[astra_connect] connect attempt "
+                f"{attempt}/{cfg.connect_attempts} failed for target='{cfg.target}' "
+                f"keyspace='{cfg.keyspace}': {exc}. Retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Astra session creation failed without an explicit exception.")
 
 
 def close_cached_cluster(*, target: Optional[str] = None) -> None:

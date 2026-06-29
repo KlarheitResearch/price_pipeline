@@ -66,6 +66,9 @@ jobs:
       PYTHONUTF8: "1"
       PYTHONWARNINGS: default
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      ASTRA_CONNECT_ATTEMPTS: "3"
+      ASTRA_CONNECT_RETRY_BASE_SEC: "5"
+      ASTRA_CONNECT_RETRY_MAX_SEC: "20"
 
       RUN_LIVE: ${{ github.event.inputs.run_live || 'true' }}
       RUN_10M: ${{ github.event.inputs.run_10m || 'true' }}

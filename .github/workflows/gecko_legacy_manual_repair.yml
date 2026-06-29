@@ -40,6 +40,26 @@ on:
         options:
           - "false"
           - "true"
+      replace_derived:
+        description: "Replace bf_* carry/derived rows"
+        type: choice
+        required: true
+        default: "true"
+        options:
+          - "true"
+          - "false"
+      precise_rank_end:
+        description: "Safety cap for precise API repair ranks"
+        required: false
+        default: "100"
+      allow_broad_ranks:
+        description: "Allow repair beyond precise_rank_end"
+        type: choice
+        required: true
+        default: "false"
+        options:
+          - "false"
+          - "true"
       dry_run:
         description: "Compute only (no writes)"
         type: choice
@@ -157,6 +177,7 @@ jobs:
           REQUEST_TIMEOUT_SEC: "45"
           FETCH_SIZE: "500"
           CG_CHUNK_HOURS: "72"
+          PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
         run: |
           set -euo pipefail
           CMD=(python prices/prod_pipeline/pipeline_health_runner.py \
@@ -168,13 +189,20 @@ jobs:
             --rank-end "${{ github.event.inputs.rank_end }}" \
             --from-utc "${{ github.event.inputs.from_utc }}" \
             --to-utc "${{ github.event.inputs.to_utc }}" \
-            --granularity "${{ github.event.inputs.granularity }}")
+            --granularity "${{ github.event.inputs.granularity }}" \
+            --precise-rank-end "${{ github.event.inputs.precise_rank_end }}")
 
           if [ -n "${{ github.event.inputs.coin_ids }}" ]; then
             CMD+=(--coin-ids "${{ github.event.inputs.coin_ids }}")
           fi
           if [ "${{ github.event.inputs.overwrite_existing }}" = "true" ]; then
             CMD+=(--overwrite-existing)
+          fi
+          if [ "${{ github.event.inputs.replace_derived }}" = "true" ]; then
+            CMD+=(--replace-derived)
+          fi
+          if [ "${{ github.event.inputs.allow_broad_ranks }}" = "true" ]; then
+            CMD+=(--allow-broad-ranks)
           fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             CMD+=(--dry-run)
