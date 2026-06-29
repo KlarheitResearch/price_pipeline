@@ -53,6 +53,28 @@ def to_cassandra_ts(dt_: datetime | None) -> datetime | None:
     return dt_.replace(tzinfo=None)
 
 
+def to_native_date(value: Any) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        date_fn = getattr(value, "date", None)
+        if callable(date_fn):
+            out = date_fn()
+            if isinstance(out, date):
+                return out
+    except Exception:
+        pass
+    try:
+        text = str(value).strip()
+        if len(text) >= 10:
+            return date.fromisoformat(text[:10])
+    except Exception:
+        pass
+    return None
+
+
 def fnum(x: Any, fallback: Optional[float] = None) -> Optional[float]:
     try:
         if x is None:
@@ -255,7 +277,7 @@ def load_latest_snapshot(
         [coin_id, daily_start, daily_end],
         timeout=REQUEST_TIMEOUT_SEC,
     ):
-        row_date = getattr(row, "date", None)
+        row_date = to_native_date(getattr(row, "date", None))
         if row_date is None:
             continue
         slot = datetime(row_date.year, row_date.month, row_date.day, 23, 59, tzinfo=UTC)
