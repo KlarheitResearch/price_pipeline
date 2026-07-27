@@ -69,6 +69,13 @@ jobs:
       ASTRA_CONNECT_ATTEMPTS: "3"
       ASTRA_CONNECT_RETRY_BASE_SEC: "5"
       ASTRA_CONNECT_RETRY_MAX_SEC: "20"
+      PP_HEALTH_CONNECT_ATTEMPTS: "1"
+      PP_HEALTH_CONNECT_RETRY_BASE_SEC: "1"
+      PP_HEALTH_CONNECT_RETRY_MAX_SEC: "1"
+      PP_HEALTH_REQUEST_TIMEOUT_SEC: "30"
+      PP_HEALTH_CONNECT_TIMEOUT_SEC: "10"
+      PP_COMMAND_ATTEMPTS: "2"
+      PP_COMMAND_RETRY_DELAY_SEC: "120"
 
       RUN_LIVE: ${{ github.event.inputs.run_live || 'true' }}
       RUN_10M: ${{ github.event.inputs.run_10m || 'true' }}

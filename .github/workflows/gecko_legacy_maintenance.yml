@@ -81,6 +81,16 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      ASTRA_CONNECT_ATTEMPTS: "3"
+      ASTRA_CONNECT_RETRY_BASE_SEC: "5"
+      ASTRA_CONNECT_RETRY_MAX_SEC: "20"
+      PP_HEALTH_CONNECT_ATTEMPTS: "1"
+      PP_HEALTH_CONNECT_RETRY_BASE_SEC: "1"
+      PP_HEALTH_CONNECT_RETRY_MAX_SEC: "1"
+      PP_HEALTH_REQUEST_TIMEOUT_SEC: "30"
+      PP_HEALTH_CONNECT_TIMEOUT_SEC: "10"
+      PP_COMMAND_ATTEMPTS: "2"
+      PP_COMMAND_RETRY_DELAY_SEC: "120"
       CONTINUITY_RANK_START: ${{ github.event.inputs.continuity_rank_start || '1' }}
       CONTINUITY_RANK_END: ${{ github.event.inputs.continuity_rank_end || '1000' }}
       CONTINUITY_LOOKBACK_HOURS: ${{ github.event.inputs.continuity_lookback_hours || '72' }}
@@ -298,6 +308,16 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      ASTRA_CONNECT_ATTEMPTS: "3"
+      ASTRA_CONNECT_RETRY_BASE_SEC: "5"
+      ASTRA_CONNECT_RETRY_MAX_SEC: "20"
+      PP_HEALTH_CONNECT_ATTEMPTS: "1"
+      PP_HEALTH_CONNECT_RETRY_BASE_SEC: "1"
+      PP_HEALTH_CONNECT_RETRY_MAX_SEC: "1"
+      PP_HEALTH_REQUEST_TIMEOUT_SEC: "30"
+      PP_HEALTH_CONNECT_TIMEOUT_SEC: "10"
+      PP_COMMAND_ATTEMPTS: "2"
+      PP_COMMAND_RETRY_DELAY_SEC: "120"
     steps:
       - uses: actions/checkout@v4
 
@@ -411,6 +431,16 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      ASTRA_CONNECT_ATTEMPTS: "3"
+      ASTRA_CONNECT_RETRY_BASE_SEC: "5"
+      ASTRA_CONNECT_RETRY_MAX_SEC: "20"
+      PP_HEALTH_CONNECT_ATTEMPTS: "1"
+      PP_HEALTH_CONNECT_RETRY_BASE_SEC: "1"
+      PP_HEALTH_CONNECT_RETRY_MAX_SEC: "1"
+      PP_HEALTH_REQUEST_TIMEOUT_SEC: "30"
+      PP_HEALTH_CONNECT_TIMEOUT_SEC: "10"
+      PP_COMMAND_ATTEMPTS: "2"
+      PP_COMMAND_RETRY_DELAY_SEC: "120"
       RUN_AUDIT: ${{ github.event.inputs.run_audit || 'true' }}
       RUN_AGG_DRIFT: ${{ github.event.inputs.run_agg_drift || 'true' }}
     steps:

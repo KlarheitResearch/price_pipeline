@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import socket
 import subprocess
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence, cast
 
@@ -53,6 +55,15 @@ def parse_int(value: Any) -> Optional[int]:
         return None
 
 
+def parse_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return default
+
+
 def first_env(*names: str) -> Optional[str]:
     for name in names:
         raw = os.getenv(name)
@@ -62,6 +73,50 @@ def first_env(*names: str) -> Optional[str]:
         if value:
             return value
     return None
+
+
+ASTRA_TRANSIENT_STRONG_PATTERNS = (
+    "unable to connect to the metadata service",
+    "cassandra.driverexception",
+    "nohostavailable",
+    "datastax/cloud",
+    "astra_connect",
+)
+
+ASTRA_TRANSIENT_CONTEXTUAL_PATTERNS = (
+    "urlopen error timed out",
+    "timeouterror: timed out",
+    "connection refused",
+    "connection reset",
+    "temporarily unavailable",
+)
+
+
+def is_transient_astra_failure(output_tail: str) -> bool:
+    text = output_tail.lower()
+    if any(pattern in text for pattern in ASTRA_TRANSIENT_STRONG_PATTERNS):
+        return True
+    has_astra_context = "metadata" in text or "astra" in text or "cassandra" in text
+    return has_astra_context and any(pattern in text for pattern in ASTRA_TRANSIENT_CONTEXTUAL_PATTERNS)
+
+
+@contextlib.contextmanager
+def temporary_env(overrides: dict[str, Optional[str]]):
+    prev: dict[str, Optional[str]] = {}
+    try:
+        for key, value in overrides.items():
+            prev[key] = os.getenv(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def detect_trigger_source() -> str:
@@ -270,6 +325,54 @@ def normalize_command(raw_command: Sequence[str]) -> list[str]:
     return command
 
 
+def run_command_with_retry(command: Sequence[str], script_id: str) -> tuple[int, int, str]:
+    attempts = max(1, parse_int(first_env("PP_COMMAND_ATTEMPTS")) or 1)
+    delay_sec = max(0.0, parse_float(first_env("PP_COMMAND_RETRY_DELAY_SEC"), 120.0))
+    tail_lines_limit = max(20, parse_int(first_env("PP_COMMAND_OUTPUT_TAIL_LINES")) or 160)
+    final_tail = ""
+
+    for attempt in range(1, attempts + 1):
+        attempt_started = time.time()
+        prefix = f"[{now_str()}] [runner] start {script_id}"
+        if attempts > 1:
+            prefix += f" attempt={attempt}/{attempts}"
+        print(f"{prefix}: {' '.join(command)}")
+
+        tail: deque[str] = deque(maxlen=tail_lines_limit)
+        proc = subprocess.Popen(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="")
+            tail.append(line)
+        return_code = proc.wait()
+        elapsed = int(time.time() - attempt_started)
+        final_tail = "".join(tail)
+        print(
+            f"[{now_str()}] [runner] end {script_id} attempt={attempt}/{attempts}: "
+            f"exit={return_code} elapsed={elapsed}s"
+        )
+
+        if return_code == 0:
+            return return_code, attempt, final_tail
+
+        if attempt >= attempts or not is_transient_astra_failure(final_tail):
+            return return_code, attempt, final_tail
+
+        print(
+            f"[{now_str()}] [runner] transient Astra connectivity failure for {script_id}; "
+            f"retrying in {delay_sec:.0f}s"
+        )
+        time.sleep(delay_sec)
+
+    return 1, attempts, final_tail
+
+
 def main() -> int:
     args = parse_args()
     command = normalize_command(args.command)
@@ -282,8 +385,22 @@ def main() -> int:
 
     if HEALTH_ENABLED:
         try:
-            AstraConfig.from_env()
-            session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
+            health_attempts = first_env("PP_HEALTH_CONNECT_ATTEMPTS") or "1"
+            health_retry_base = first_env("PP_HEALTH_CONNECT_RETRY_BASE_SEC") or "1"
+            health_retry_max = first_env("PP_HEALTH_CONNECT_RETRY_MAX_SEC") or health_retry_base
+            health_request_timeout = first_env("PP_HEALTH_REQUEST_TIMEOUT_SEC") or "30"
+            health_connect_timeout = first_env("PP_HEALTH_CONNECT_TIMEOUT_SEC") or "10"
+            with temporary_env(
+                {
+                    "ASTRA_CONNECT_ATTEMPTS": health_attempts,
+                    "ASTRA_CONNECT_RETRY_BASE_SEC": health_retry_base,
+                    "ASTRA_CONNECT_RETRY_MAX_SEC": health_retry_max,
+                    "REQUEST_TIMEOUT_SEC": health_request_timeout,
+                    "CONNECT_TIMEOUT_SEC": health_connect_timeout,
+                }
+            ):
+                AstraConfig.from_env()
+                session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
             tracker = PipelineHealthTracker(
                 session,
                 args.script_id,
@@ -301,18 +418,21 @@ def main() -> int:
         print(f"[{now_str()}] [health] disabled by PP_HEALTH_ENABLED=0")
 
     started = time.time()
-    print(f"[{now_str()}] [runner] start {args.script_id}: {' '.join(command)}")
-    completed = subprocess.run(command, check=False)
+    return_code, command_attempts_used, output_tail = run_command_with_retry(command, args.script_id)
     elapsed = int(time.time() - started)
-    print(f"[{now_str()}] [runner] end {args.script_id}: exit={completed.returncode} elapsed={elapsed}s")
+    print(f"[{now_str()}] [runner] final {args.script_id}: exit={return_code} elapsed={elapsed}s")
 
     if tracker is not None:
-        tracker.set_metric("exit_code", completed.returncode)
+        tracker.set_metric("exit_code", return_code)
         tracker.set_metric("elapsed_sec", elapsed)
-        if completed.returncode == 0:
+        tracker.set_metric("command_attempts", command_attempts_used)
+        if return_code == 0:
             tracker.finish("success")
         else:
-            tracker.finish("failed", f"Command exited with code {completed.returncode}")
+            error_text = f"Command exited with code {return_code}"
+            if is_transient_astra_failure(output_tail):
+                error_text += " after transient Astra connectivity retries"
+            tracker.finish("failed", error_text)
 
     if cluster is not None:
         try:
@@ -320,7 +440,7 @@ def main() -> int:
         except Exception:
             pass
 
-    return int(completed.returncode)
+    return int(return_code)
 
 
 if __name__ == "__main__":

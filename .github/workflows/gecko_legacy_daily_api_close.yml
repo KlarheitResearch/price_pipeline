@@ -61,6 +61,16 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONUTF8: "1"
       ASTRA_TARGET: ${{ vars.ASTRA_TARGET != '' && vars.ASTRA_TARGET || 'main' }}
+      ASTRA_CONNECT_ATTEMPTS: "3"
+      ASTRA_CONNECT_RETRY_BASE_SEC: "5"
+      ASTRA_CONNECT_RETRY_MAX_SEC: "20"
+      PP_HEALTH_CONNECT_ATTEMPTS: "1"
+      PP_HEALTH_CONNECT_RETRY_BASE_SEC: "1"
+      PP_HEALTH_CONNECT_RETRY_MAX_SEC: "1"
+      PP_HEALTH_REQUEST_TIMEOUT_SEC: "30"
+      PP_HEALTH_CONNECT_TIMEOUT_SEC: "10"
+      PP_COMMAND_ATTEMPTS: "2"
+      PP_COMMAND_RETRY_DELAY_SEC: "120"
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       RANK_START_RESOLVED: ${{ github.event.inputs.rank_start || '1' }}
       RANK_END_RESOLVED: ${{ github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '300' }}
