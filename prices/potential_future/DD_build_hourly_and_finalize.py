@@ -31,7 +31,7 @@ from prices.potential_future.common import (
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 SLOT_DELAY_SEC = int(os.getenv("PP_SLOT_DELAY_SEC", "90"))
-HOURLY_FINALIZE_LOOKBACK = int(os.getenv("PP_HOURLY_FINALIZE_LOOKBACK", "2"))
+HOURLY_FINALIZE_LOOKBACK = int(os.getenv("PP_HOURLY_FINALIZE_LOOKBACK", "6"))
 DD_API_MODE = (os.getenv("PP_DD_API_MODE", "missing_only") or "missing_only").strip().lower()
 if DD_API_MODE not in {"off", "missing_only", "always"}:
     DD_API_MODE = "missing_only"
@@ -68,13 +68,40 @@ def _source(existing_row) -> str:
     return (getattr(existing_row, "candle_source", None) or "").strip().lower() if existing_row is not None else ""
 
 
+def _authoritative_api_row(existing_row) -> bool:
+    src = _source(existing_row)
+    if src not in {"cg_hourly_final", "manual_api_hourly", "hourly_api"}:
+        return False
+    return _i(getattr(existing_row, "point_count", None), 0) >= 2
+
+
+def _hourly_row_invalid(existing_row) -> bool:
+    if existing_row is None:
+        return True
+    values = [_f(getattr(existing_row, key, None)) for key in ("open", "high", "low", "close")]
+    if any(value is None for value in values):
+        return True
+    open_, high, low, close = values
+    if high < max(open_, close) or low > min(open_, close) or high < low:
+        return True
+    slot = to_utc(getattr(existing_row, "ts", None))
+    last_updated = to_utc(getattr(existing_row, "last_updated", None))
+    return slot is not None and last_updated is not None and last_updated < slot - timedelta(minutes=20)
+
+
+def _weak_hourly_source(src: str) -> bool:
+    return src in _HOURLY_WEAK_SOURCES or any(token in src for token in ("carry", "interp", "partial"))
+
+
 def _needs_provisional_rebuild(existing_row) -> bool:
     if existing_row is None:
         return True
     src = _source(existing_row)
-    if src == "cg_hourly_final":
+    if _authoritative_api_row(existing_row):
         return False
-    if src in _HOURLY_WEAK_SOURCES:
+    if _hourly_row_invalid(existing_row):
+        return True
+    if _weak_hourly_source(src):
         return True
     pts = _i(getattr(existing_row, "point_count", None), 0)
     return pts < DD_MIN_POINTS_FOR_FINAL
@@ -86,11 +113,13 @@ def _needs_api_finalize(existing_row) -> bool:
     if existing_row is None:
         return True
     src = _source(existing_row)
-    if src == "cg_hourly_final":
+    if _authoritative_api_row(existing_row):
         return False
+    if _hourly_row_invalid(existing_row):
+        return True
     if DD_API_MODE == "always":
         return True
-    if src in _HOURLY_WEAK_SOURCES:
+    if _weak_hourly_source(src):
         return True
     pts = _i(getattr(existing_row, "point_count", None), 0)
     return pts < DD_MIN_POINTS_FOR_FINAL
@@ -104,7 +133,22 @@ def _pick_price_from_row(row):
     return None
 
 
+def _strong_10m_row(row) -> bool:
+    source = (getattr(row, "candle_source", None) or "").strip().lower()
+    if any(token in source for token in ("carry", "from_daily", "from_hourly", "interp")):
+        return False
+    points = getattr(row, "point_count", None)
+    if points is not None and _i(points, 0) <= 0:
+        return False
+    ts = to_utc(getattr(row, "ts", None))
+    last_updated = to_utc(getattr(row, "last_updated", None))
+    if ts is not None and last_updated is not None and last_updated < ts - timedelta(minutes=20):
+        return False
+    return _pick_price_from_row(row) is not None
+
+
 def build_hour_from_10m(rows, slot_start, slot_end):
+    rows = [row for row in rows if _strong_10m_row(row)]
     if not rows:
         return None
     ordered = sorted(rows, key=lambda r: to_utc(getattr(r, "ts", None)) or slot_start)
@@ -218,14 +262,15 @@ def main() -> None:
             SELECT ts, open, high, low, close, price_usd,
                    market_cap, volume_24h, market_cap_rank,
                    circulating_supply, total_supply,
-                   point_count, last_updated
+                   candle_source, point_count, last_updated
             FROM {TABLE_10M}
             WHERE id=? AND ts>=? AND ts<?
             """
         )
         sel_hourly_one = session.prepare(
             f"""
-            SELECT candle_source, point_count, circulating_supply, total_supply
+            SELECT ts, open, high, low, close, candle_source, point_count,
+                   circulating_supply, total_supply, last_updated
             FROM {TABLE_HOURLY}
             WHERE id=? AND ts=? LIMIT 1
             """
@@ -300,7 +345,7 @@ def main() -> None:
                 hour_start = item["hour_start"]
                 hour_end = item["hour_end"]
                 existing = item["existing"]
-                if _source(existing) == "cg_hourly_final":
+                if _authoritative_api_row(existing):
                     # Keep finalized candle stable: never overwrite with 10m reconstruction.
                     continue
 
@@ -351,7 +396,7 @@ def main() -> None:
                     continue
 
                 prices = extract_series_in_window(api_finalize_data.get("prices", []) or [], hour_start, hour_end)
-                if not prices:
+                if len(prices) < 2:
                     continue
                 price_values = [v for _, v in prices]
                 open_price = price_values[0]

@@ -185,7 +185,7 @@ def _fetch_market_chart_chunked(
     step = timedelta(days=max(1, int(chunk_days)))
     while cur < end_ts_exclusive:
         nxt = min(end_ts_exclusive, cur + step)
-        data = cg_market_chart_range(coin_id, cur, nxt, vs_currency="usd")
+        data = cg_market_chart_range(coin_id, cur, nxt, vs_currency="usd", interval="hourly")
         calls += 1
         prices_all.extend(extract_series_in_window(data.get("prices", []) or [], cur, nxt))
         mcap_all.extend(extract_series_in_window(data.get("market_caps", []) or [], cur, nxt))

@@ -54,7 +54,7 @@ SEL_10M_ONE = session.prepare(f"""
 SEL_DAILY_ONE = session.prepare(f"""
   SELECT date, symbol, name,
          price_usd, market_cap, volume_24h, last_updated,
-         open, high, low, close, candle_source,
+         open, high, low, close, candle_source, point_count,
          market_cap_rank, circulating_supply, total_supply
   FROM {DAILY_TABLE}
   WHERE id = ? AND date = ? LIMIT 1
@@ -74,7 +74,8 @@ SEL_DAILY_LAST = session.prepare(f"""
   WHERE id = ? ORDER BY date DESC LIMIT 1
 """)
 SEL_DAILY_FOR_ID_RANGE_ALL = session.prepare(f"""
-  SELECT date, last_updated, market_cap, volume_24h
+  SELECT date, last_updated, market_cap, volume_24h,
+         open, high, low, close, candle_source, point_count
   FROM {DAILY_TABLE}
   WHERE id = ? AND date >= ? AND date <= ?
 """)
@@ -106,8 +107,8 @@ INS_DAY = session.prepare(f"""
      open, high, low, close, price_usd,
      market_cap, volume_24h,
      market_cap_rank, circulating_supply, total_supply,
-     candle_source, last_updated)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     candle_source, last_updated, point_count)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 INS_HOURLY = session.prepare(f"""
   INSERT INTO {HOURLY_TABLE}

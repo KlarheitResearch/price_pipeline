@@ -24,7 +24,7 @@ on:
         required: false
         default: "true"
       run_audit:
-        description: "Run audit_10m_gaps.py"
+        description: "Run gap and intraday quality audits"
         required: false
         default: "true"
       run_agg_drift:
@@ -48,9 +48,13 @@ on:
         required: false
         default: "100"
       precise_10m_lookback_hours:
-        description: "Precise 10m API repair lookback window in hours"
+        description: "Recent 10m repair lookback; keep below the 24h API boundary"
         required: false
-        default: "24"
+        default: "23"
+      precise_api_call_budget:
+        description: "Maximum CoinGecko HTTP attempts per precise repair step"
+        required: false
+        default: "25"
       precise_hourly_lookback_hours:
         description: "Precise hourly API repair lookback window in hours"
         required: false
@@ -95,9 +99,10 @@ jobs:
       CONTINUITY_RANK_END: ${{ github.event.inputs.continuity_rank_end || '1000' }}
       CONTINUITY_LOOKBACK_HOURS: ${{ github.event.inputs.continuity_lookback_hours || '72' }}
       PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
-      PRECISE_10M_LOOKBACK_HOURS: ${{ github.event.inputs.precise_10m_lookback_hours || '24' }}
+      PRECISE_10M_LOOKBACK_HOURS: ${{ github.event.inputs.precise_10m_lookback_hours || '23' }}
       PRECISE_HOURLY_LOOKBACK_HOURS: ${{ github.event.inputs.precise_hourly_lookback_hours || '168' }}
       PRECISE_REPLACE_DERIVED: ${{ github.event.inputs.precise_replace_derived || 'true' }}
+      PRECISE_API_CALL_BUDGET: ${{ github.event.inputs.precise_api_call_budget || '25' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -208,9 +213,9 @@ jobs:
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           REQUEST_TIMEOUT_SEC: "45"
           FETCH_SIZE: "500"
-          CG_CHUNK_HOURS: "72"
+          CG_CHUNK_HOURS: "2400"
           PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
-          AUTHORITATIVE_10M_MAX_HOURS: ${{ github.event.inputs.precise_10m_lookback_hours || '24' }}
+          AUTHORITATIVE_10M_MAX_HOURS: "23.9"
         run: |
           set -euo pipefail
           TO_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -226,7 +231,9 @@ jobs:
             --from-utc "${FROM_UTC}" \
             --to-utc "${TO_UTC}" \
             --granularity "10m" \
-            --precise-rank-end "${PRECISE_RANK_END}")
+            --precise-rank-end "${PRECISE_RANK_END}" \
+            --repair-source "local-first" \
+            --api-call-budget "${PRECISE_API_CALL_BUDGET}")
 
           if [ "${PRECISE_REPLACE_DERIVED}" = "true" ]; then
             CMD+=(--replace-derived)
@@ -243,7 +250,7 @@ jobs:
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           REQUEST_TIMEOUT_SEC: "45"
           FETCH_SIZE: "500"
-          CG_CHUNK_HOURS: "72"
+          CG_CHUNK_HOURS: "2400"
           PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
         run: |
           set -euo pipefail
@@ -261,6 +268,8 @@ jobs:
               --to-utc "${TO_UTC}" \
               --granularity "hourly" \
               --precise-rank-end "${PRECISE_RANK_END}" \
+              --repair-source "local-first" \
+              --api-call-budget "${PRECISE_API_CALL_BUDGET}" \
               --overwrite-existing
 
       - name: Refresh live tables from raw continuity
@@ -538,6 +547,35 @@ jobs:
           python prices/prod_pipeline/pipeline_health_runner.py \
             --script-id audit_10m_gaps \
             -- python prices/prod_pipeline/audit_10m_gaps.py
+
+      - name: Intraday flatline/provenance audit (top 100)
+        if: env.RUN_AUDIT == 'true'
+        timeout-minutes: 15
+        run: |
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id audit_intraday_quality \
+            --rank-start "1" \
+            --rank-end "100" \
+            -- python prices/prod_pipeline/audit_intraday_quality.py \
+              --rank-start "1" \
+              --rank-end "100" \
+              --granularity both \
+              --hours-10m "24" \
+              --hours-hourly "168"
+
+      - name: Daily OHLC semantic audit (top 100)
+        if: env.RUN_AUDIT == 'true'
+        timeout-minutes: 15
+        run: |
+          python prices/prod_pipeline/pipeline_health_runner.py \
+            --script-id audit_daily_ohlc_quality \
+            --rank-start "1" \
+            --rank-end "100" \
+            -- python prices/prod_pipeline/audit_daily_ohlc_quality.py \
+              --rank-start "1" \
+              --rank-end "100" \
+              --lookback-days "14" \
+              --fail-on-definite
 
       - name: 10m aggregate drift audit
         if: env.RUN_AGG_DRIFT == 'true'

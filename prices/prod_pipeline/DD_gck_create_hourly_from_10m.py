@@ -62,6 +62,15 @@ if AGG_MIN_COINS < 0:
     AGG_MIN_COINS = 0
 AGG_CARRY_FORWARD = os.getenv("AGG_CARRY_FORWARD", "0") == "1"
 
+# Do not let the regular rollup undo a higher-quality API repair. A repaired
+# hourly row is replaced only when every expected 10m slot has a strong point.
+PROTECT_API_REPAIRS = os.getenv("PROTECT_API_REPAIRS", "1") == "1"
+MAX_WEAK_10M_RATIO_FOR_API_REPLACE = float(
+    os.getenv("MAX_WEAK_10M_RATIO_FOR_API_REPLACE", "0")
+)
+if not 0.0 <= MAX_WEAK_10M_RATIO_FOR_API_REPLACE <= 1.0:
+    raise ValueError("MAX_WEAK_10M_RATIO_FOR_API_REPLACE must be between 0 and 1")
+
 # Table names (Gecko pipeline)
 TEN_MIN_TABLE           = os.getenv("TEN_MIN_TABLE", "gecko_prices_10m_7d")
 HOURLY_TABLE            = os.getenv("HOURLY_TABLE", "gecko_candles_hourly_30d")
@@ -138,6 +147,31 @@ def vprint(msg: str):
     if VERBOSE_MODE:
         print(msg)
 
+def ten_min_source_is_weak(source: Any, point_count: Any) -> bool:
+    """Return True for carried, synthetic, interpolated, or legacy 10m points."""
+    src = str(source or "").strip().lower()
+    try:
+        if point_count is not None and int(point_count) <= 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    if not src:
+        return True
+    return (
+        src.startswith("bf_")
+        or "carry" in src
+        or "interp" in src
+        or src in {"repair_unknown", "unknown"}
+    )
+
+def hourly_source_is_authoritative(source: Any) -> bool:
+    """Hourly values fetched directly from CoinGecko by a repair script."""
+    return str(source or "").strip().lower() in {
+        "hourly_api",
+        "manual_api",
+        "manual_api_hourly",
+    }
+
 def rebuild_all_from_categories(hour_totals: Dict[Tuple[datetime, str], Dict[str, Any]]) -> Dict[Tuple[datetime, str], Dict[str, Any]]:
     """
     Ensure the ALL bucket equals the sum of category buckets for each hour.
@@ -192,13 +226,15 @@ def main():
     t0 = time.time()
     SEL_10M_RANGE = session.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h,
-             market_cap_rank, circulating_supply, total_supply, last_updated
+             market_cap_rank, circulating_supply, total_supply, last_updated,
+             candle_source, point_count
       FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts>=? AND ts<?
     """)
     SEL_10M_PREV = session.prepare(f"""
       SELECT ts, price_usd, market_cap, volume_24h,
-             market_cap_rank, circulating_supply, total_supply, last_updated
+             market_cap_rank, circulating_supply, total_supply, last_updated,
+             candle_source, point_count
       FROM {TEN_MIN_TABLE}
       WHERE id=? AND ts<? LIMIT 1
     """)
@@ -278,7 +314,7 @@ def main():
     def bump_hour_count(slot_start: datetime) -> None:
         hour_coin_counts[slot_start] = hour_coin_counts.get(slot_start, 0) + 1
 
-    wrote = skipped = empty = errors = finalized_skips = unchanged_skips = 0
+    wrote = skipped = empty = errors = finalized_skips = unchanged_skips = protected_api_skips = 0
 
     def iter_hours(start: datetime, end: datetime):
         h = start
@@ -289,6 +325,8 @@ def main():
     def make_bucket() -> Dict[str, Any]:
         return {
             "price_count": 0,
+            "weak_price_count": 0,
+            "sources": set(),
             "earliest_ts": None,
             "latest_ts": None,
             "open": None,
@@ -310,11 +348,21 @@ def main():
             bucket[key] = value
             bucket[ts_key] = row_ts
 
-    def update_bucket(bucket: Dict[str, Any], row_ts: datetime, row) -> None:
+    def update_bucket(
+        bucket: Dict[str, Any],
+        row_ts: datetime,
+        row,
+        *,
+        force_weak: bool = False,
+    ) -> None:
         price = getattr(row, "price_usd", None)
         if price is not None:
             price = float(price)
             bucket["price_count"] += 1
+            source = getattr(row, "candle_source", None)
+            bucket["sources"].add(str(source or "legacy_unknown"))
+            if force_weak or ten_min_source_is_weak(source, getattr(row, "point_count", None)):
+                bucket["weak_price_count"] += 1
             if bucket["earliest_ts"] is None or row_ts < bucket["earliest_ts"]:
                 bucket["earliest_ts"] = row_ts
                 bucket["open"] = price
@@ -363,6 +411,8 @@ def main():
             circulating_supply=sanitize_num(getattr(coin_row, "circulating_supply", None)),
             total_supply=sanitize_num(getattr(coin_row, "total_supply", None)),
             last_updated=row_ts,
+            candle_source="live_overlay",
+            point_count=1,
         )
         update_bucket(bucket, row_ts, live_point)
         return True
@@ -513,7 +563,9 @@ def main():
             if prev and prev.price_usd is not None:
                 ts_prev = ensure_aware_utc(getattr(prev, "ts", None)) or hour_start
                 bucket = buckets.setdefault(hour_start, make_bucket())
-                update_bucket(bucket, ts_prev, prev)
+                # A point from before the hour is a carry even when its stored
+                # source was direct in its original slot.
+                update_bucket(bucket, ts_prev, prev, force_weak=True)
                 return True
             return False
 
@@ -597,9 +649,33 @@ def main():
             candle_source = "10m_final" if is_final else "10m_partial"
             last_upd = bucket["last_updated"] or (end - timedelta(seconds=1))
 
-            existing = None
+            existing = get_existing(start)
+            expected_points = max(1, int((end - start).total_seconds() // 600))
+            missing_points = max(0, expected_points - price_count)
+            weak_points = int(bucket.get("weak_price_count", 0)) + missing_points
+            weak_ratio = weak_points / expected_points
+            if (
+                PROTECT_API_REPAIRS
+                and existing
+                and hourly_source_is_authoritative(getattr(existing, "candle_source", None))
+                and weak_ratio > MAX_WEAK_10M_RATIO_FOR_API_REPLACE
+            ):
+                mcap_exist = sanitize_num(getattr(existing, "market_cap", None), 0.0)
+                vol_exist = sanitize_num(getattr(existing, "volume_24h", None), 0.0)
+                last_upd_e = existing_last_upd_cache.get(start) or (end - timedelta(seconds=1))
+                bump_hour_total(start, coin_category, mcap_exist, vol_exist, last_upd_e)
+                bump_hour_total(start, 'ALL', mcap_exist, vol_exist, last_upd_e)
+                bump_hour_count(start)
+                protected_api_skips += 1
+                vprint(
+                    f"[{now_str()}]    {c.symbol} {start.isoformat()} preserve "
+                    f"{getattr(existing, 'candle_source', None)}: 10m quality "
+                    f"weak_or_missing={weak_points}/{expected_points} "
+                    f"sources={sorted(bucket.get('sources', set()))}"
+                )
+                continue
+
             if is_final:
-                existing = get_existing(start)
                 if existing and getattr(existing, "candle_source", None) == "10m_final":
                     same = all([
                         equalish(o, existing.open),
@@ -624,7 +700,6 @@ def main():
                         vprint(f"[{now_str()}]    {c.symbol} {start.isoformat()} already final & identical → aggregate existing; skip write")
                         continue
             else:
-                existing = get_existing(start)
                 if existing and getattr(existing, "candle_source", None) == "10m_partial":
                     same = all([
                         equalish(o, existing.open),
@@ -820,7 +895,8 @@ def main():
 
     print(
         f"[{now_str()}] [hourly-from-10m] wrote={wrote} skipped={skipped} empty={empty} "
-        f"errors={errors} already_final_identical={finalized_skips} partial_unchanged_skips={unchanged_skips}"
+        f"errors={errors} already_final_identical={finalized_skips} "
+        f"partial_unchanged_skips={unchanged_skips} protected_api_skips={protected_api_skips}"
     )
 
 # ───────────────────────── Entrypoint ─────────────────────────

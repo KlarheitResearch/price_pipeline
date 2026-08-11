@@ -36,6 +36,7 @@ INTERPOLATE_IF_API_MISS = os.getenv("INTERPOLATE_IF_API_MISS", "1") == "1"
 BACKFILL_DAILY_FROM_API = os.getenv("BACKFILL_DAILY_FROM_API", "1") == "1"
 FULL_DAILY_ALL          = os.getenv("FULL_DAILY_ALL", "1") == "1"
 FILL_HOURLY_BADSCAN     = os.getenv("FILL_HOURLY_BADSCAN", "1") == "1"
+FILL_DAILY_BADSCAN      = os.getenv("FILL_DAILY_BADSCAN", "1") == "1"
 
 # Aggregate recompute toggles
 FULL_MODE = os.getenv("FULL_MODE", "1") == "1"
@@ -82,8 +83,10 @@ BASE = os.getenv(
     "https://api.coingecko.com/api/v3" if API_TIER == "demo" else "https://pro-api.coingecko.com/api/v3"
 )
 
-# Daily API backfill request budget
+# API backfill budgets. Both count actual HTTP attempts, including retries.
 DAILY_API_REQ_BUDGET = int(os.getenv("DAILY_API_REQ_BUDGET", "150"))
+HOURLY_API_REQ_BUDGET = int(os.getenv("HOURLY_API_REQ_BUDGET", "25"))
+HOURLY_API_CHUNK_HOURS = min(100 * 24, int(os.getenv("HOURLY_API_CHUNK_HOURS", str(100 * 24))))
 PAD_DAYS             = int(os.getenv("DAILY_API_PAD_DAYS", "1"))
 MAX_RANGE_DAYS       = int(os.getenv("DAILY_API_MAX_RANGE_DAYS", "90"))
 

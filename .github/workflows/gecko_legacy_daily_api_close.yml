@@ -1,6 +1,10 @@
 name: gecko-legacy-daily-api-close
 
 on:
+  schedule:
+    # One request per coin covers the trailing seven days at hourly granularity.
+    # Top 100 => about 3,000 normal HTTP attempts/month before retries.
+    - cron: "25 01 * * *"
   workflow_dispatch:
     inputs:
       run_daily_api_close:
@@ -43,6 +47,10 @@ on:
         description: "Verbose (0/1)"
         required: false
         default: "0"
+      API_ATTEMPT_BUDGET:
+        description: "Hard CoinGecko HTTP-attempt budget, including retries"
+        required: false
+        default: "300"
 
 permissions:
   contents: read
@@ -73,7 +81,7 @@ jobs:
       PP_COMMAND_RETRY_DELAY_SEC: "120"
       VERBOSE_RESOLVED: ${{ github.event.inputs.VERBOSE_MODE || '0' }}
       RANK_START_RESOLVED: ${{ github.event.inputs.rank_start || '1' }}
-      RANK_END_RESOLVED: ${{ github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '300' }}
+      RANK_END_RESOLVED: ${{ github.event_name == 'schedule' && '100' || github.event.inputs.rank_end || github.event.inputs.TOP_N_API_DAILY || '300' }}
       COIN_IDS_RESOLVED: ${{ github.event.inputs.coin_ids || '' }}
     steps:
       - uses: actions/checkout@v4
@@ -164,7 +172,7 @@ jobs:
           COINGECKO_API_TIER: ${{ secrets.COINGECKO_API_TIER != '' && secrets.COINGECKO_API_TIER || 'demo' }}
           COINGECKO_API_KEYS: "${{ secrets.COINGECKO_API_KEY_AA }},${{ secrets.COINGECKO_API_KEY_BB }},${{ secrets.COINGECKO_API_KEY_CC }},${{ secrets.COINGECKO_API_KEY_DD }}"
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
-          TOP_N_API_DAILY: ${{ github.event.inputs.TOP_N_API_DAILY || '300' }}
+          TOP_N_API_DAILY: ${{ github.event_name == 'schedule' && '100' || github.event.inputs.TOP_N_API_DAILY || '300' }}
           TOP_N_AGG_DAILY: ${{ github.event.inputs.TOP_N_AGG_DAILY || '1000' }}
           RANK_START: ${{ env.RANK_START_RESOLVED }}
           RANK_END: ${{ env.RANK_END_RESOLVED }}
@@ -172,6 +180,10 @@ jobs:
           TARGET_START_DAY_ISO: ${{ github.event.inputs.TARGET_START_DAY_ISO || '' }}
           TARGET_END_DAY_ISO: ${{ github.event.inputs.TARGET_END_DAY_ISO || '' }}
           TARGET_DAY_ISO: ${{ github.event.inputs.TARGET_DAY_ISO || '' }}
+          DEFAULT_LOOKBACK_DAYS: "7"
+          CG_DAILY_INTERVAL: "hourly"
+          MIN_API_POINTS_PER_DAY: "2"
+          API_ATTEMPT_BUDGET: ${{ github.event_name == 'schedule' && '120' || github.event.inputs.API_ATTEMPT_BUDGET || '300' }}
           REBUILD_MCAP_DAILY: "1"
           REQUEST_TIMEOUT_SEC: "45"
           CG_BACKOFF_BASE_S: "3"

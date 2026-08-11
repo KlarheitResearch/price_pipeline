@@ -20,7 +20,7 @@ FETCH_SIZE          = int(os.getenv("FETCH_SIZE", "500"))
 SLOT_DELAY_SEC      = int(os.getenv("SLOT_DELAY_SEC", "180"))
 PROGRESS_EVERY      = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE_MODE        = os.getenv("VERBOSE_MODE", "0") == "1"
-MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "2"))
+MIN_10M_POINTS_FOR_FINAL = int(os.getenv("MIN_10M_POINTS_FOR_FINAL", "72"))
 BOOTSTRAP_BACKFILL_DAYS  = int(os.getenv("BOOTSTRAP_BACKFILL_DAYS", "7"))
 MAX_CATCHUP_DAYS         = min(int(os.getenv("MAX_CATCHUP_DAYS", "7")), 7)
 CURRENT_ONLY             = os.getenv("CURRENT_ONLY", "0") == "1"
@@ -132,14 +132,15 @@ SEL_LIVE = SimpleStatement(
 
 SEL_10M_RANGE = session.prepare(f"""
   SELECT ts, price_usd, market_cap, volume_24h,
-         market_cap_rank, circulating_supply, total_supply, last_updated
+         market_cap_rank, circulating_supply, total_supply, last_updated,
+         candle_source, point_count
   FROM {TEN_MIN_TABLE}
   WHERE id=? AND ts>=? AND ts<?
 """)
 
 SEL_DAILY_ONE = session.prepare(f"""
   SELECT symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
-         market_cap_rank, circulating_supply, total_supply, candle_source, last_updated
+         market_cap_rank, circulating_supply, total_supply, candle_source, last_updated, point_count
   FROM {DAILY_TABLE}
   WHERE id=? AND date=? LIMIT 1
 """)
@@ -160,8 +161,8 @@ INS_UPSERT = session.prepare(f"""
      open, high, low, close, price_usd,
      market_cap, volume_24h,
      market_cap_rank, circulating_supply, total_supply,
-     candle_source, last_updated)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     candle_source, last_updated, point_count)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """)
 
 INS_MCAP_DAILY = session.prepare(f"""
@@ -180,6 +181,7 @@ SEL_MCAP_DAILY_PREV = session.prepare(f"""
 def make_bucket() -> Dict[str, Any]:
     return {
         "price_count": 0,
+        "raw_price_count": 0,
         "earliest_ts": None,
         "latest_ts": None,
         "open": None,
@@ -233,9 +235,29 @@ def update_last_non_null(bucket: Dict[str, Any], key: str, ts_key: str, value, r
         bucket[ts_key] = row_ts
 
 
+def weak_intraday_row(row_ts: datetime, row) -> bool:
+    source = (getattr(row, "candle_source", None) or "").strip().lower()
+    weak_tokens = ("carry", "from_daily", "from_hourly", "interp")
+    if any(token in source for token in weak_tokens):
+        return True
+    point_count = getattr(row, "point_count", None)
+    if point_count is not None:
+        try:
+            if int(point_count) <= 0:
+                return True
+        except Exception:
+            return True
+    last_updated = ensure_aware_utc(getattr(row, "last_updated", None))
+    if last_updated is not None and last_updated < row_ts - timedelta(minutes=20):
+        return True
+    return False
+
+
 def update_bucket(bucket: Dict[str, Any], row_ts: datetime, row) -> None:
     price = getattr(row, "price_usd", None)
     if price is not None:
+        bucket["raw_price_count"] += 1
+    if price is not None and not weak_intraday_row(row_ts, row):
         price = float(price)
         bucket["price_count"] += 1
         if bucket["earliest_ts"] is None or row_ts < bucket["earliest_ts"]:
@@ -287,6 +309,8 @@ def overlay_live_on_partial_day(
         circulating_supply=sanitize_num(getattr(coin_row, "circulating_supply", None)),
         total_supply=sanitize_num(getattr(coin_row, "total_supply", None)),
         last_updated=row_ts,
+        candle_source="live_direct",
+        point_count=1,
     )
     update_bucket(bucket, row_ts, live_point)
     return True
@@ -485,7 +509,8 @@ def main():
             if price_count < MIN_10M_POINTS_FOR_FINAL:
                 if VERBOSE_MODE:
                     print(
-                        f"[{now_str()}]    {c.symbol} {d} final: insufficient 10m points ({price_count}) "
+                        f"[{now_str()}]    {c.symbol} {d} final: insufficient strong 10m points "
+                        f"({price_count}/{bucket['raw_price_count']}) "
                         "-> aggregate existing; skip write"
                     )
                 aggregate_existing(d)
@@ -556,6 +581,7 @@ def main():
                         mcap, vol,
                         rank, circ, tot,
                         candle_source, to_cassandra_ts(last_upd),
+                        int(price_count),
                     ],
                     timeout=REQUEST_TIMEOUT,
                 )
@@ -646,6 +672,7 @@ def main():
                             mcap, vol,
                             rank, circ, tot,
                             candle_source, to_cassandra_ts(last_upd),
+                            int(price_count),
                         ],
                         timeout=REQUEST_TIMEOUT,
                     )

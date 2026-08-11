@@ -88,6 +88,7 @@ VERBOSE_MODE = os.getenv("VERBOSE_MODE", "0") == "1"
 PROGRESS_EVERY = max(1, int(os.getenv("PROGRESS_EVERY", "100")))
 APPEND_SKIP_EXISTING = os.getenv("APPEND_SKIP_EXISTING", "1") == "1"
 APPEND_AGG_FROM_EXISTING = os.getenv("APPEND_AGG_FROM_EXISTING", "0") == "1"
+UPGRADE_WEAK_EXISTING = os.getenv("UPGRADE_WEAK_EXISTING", "1") == "1"
 LOG_SLOT_LINES = VERBOSE_MODE and (os.getenv("LOG_SLOT_LINES", "0") == "1")
 LOG_INSERT_LINES = VERBOSE_MODE and (os.getenv("LOG_INSERT_LINES", "0") == "1")
 COIN_WORKERS = max(1, int(os.getenv("COIN_WORKERS", "8")))
@@ -218,9 +219,18 @@ SEL_PREV_PS = session.prepare(
 INS_10M_IF_NOT_EXISTS_PS = session.prepare(
     f"""
     INSERT INTO {TABLE_OUT}
-      (id, ts, symbol, name, price_usd, market_cap, volume_24h,
-       market_cap_rank, circulating_supply, total_supply, last_updated)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+      (id, ts, symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
+       market_cap_rank, circulating_supply, total_supply, last_updated, candle_source, point_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS
+    """
+)
+
+INS_10M_UPSERT_PS = session.prepare(
+    f"""
+    INSERT INTO {TABLE_OUT}
+      (id, ts, symbol, name, open, high, low, close, price_usd, market_cap, volume_24h,
+       market_cap_rank, circulating_supply, total_supply, last_updated, candle_source, point_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
 
@@ -229,7 +239,8 @@ INS_10M_IF_NOT_EXISTS_PS = session.prepare(
 SEL_10M_EXISTING_TS_RANGE_PS = session.prepare(
     f"""
     SELECT ts, price_usd, market_cap, volume_24h,
-           market_cap_rank, circulating_supply, total_supply, last_updated
+           market_cap_rank, circulating_supply, total_supply, last_updated,
+           candle_source, point_count
     FROM {TABLE_OUT}
     WHERE id=? AND ts>=? AND ts<?
     """
@@ -498,7 +509,18 @@ def _point_from_row(row: Any) -> Dict[str, Any] | None:
         "rank": int(getattr(row, "market_cap_rank")) if getattr(row, "market_cap_rank", None) is not None else None,
         "circ": float(getattr(row, "circulating_supply")) if getattr(row, "circulating_supply", None) is not None else None,
         "totl": float(getattr(row, "total_supply")) if getattr(row, "total_supply", None) is not None else None,
+        "source": (getattr(row, "candle_source", None) or "").strip().lower() or None,
+        "point_count": int(getattr(row, "point_count")) if getattr(row, "point_count", None) is not None else None,
     }
+
+
+def source_is_weak(source: str | None) -> bool:
+    text = (source or "").strip().lower()
+    return (
+        not text
+        or text.startswith("bf_")
+        or text in {"hist-carry", "rolling_carry", "repair_unknown", "hourly_interp"}
+    )
 
 
 def plan_coin_slots(
@@ -596,21 +618,56 @@ def plan_coin_slots(
     carry_used = 0
     entries: List[Dict[str, Any]] = []
     for start, end in slots:
+        point = slot_points.get(start)
         if start in existing_ts:
-            # Keep carry chain aligned with persisted rows in this window.
-            # Without this, a missing tail slot can carry from a stale pre-window point.
             existing_point = existing_points.get(start)
-            if existing_point is not None:
+            existing_source = existing_point.get("source") if existing_point else None
+
+            # A real observation is allowed to upgrade a legacy/carry row. Authoritative
+            # or already-direct rows remain protected from lower-quality rewrites.
+            if (
+                UPGRADE_WEAK_EXISTING
+                and point is not None
+                and source_is_weak(cast(str | None, existing_source))
+            ):
+                last_real_point = point
+                carry_used = 0
+                entries.append(
+                    {
+                        "kind": "insert",
+                        "write_mode": "upsert",
+                        "start": start,
+                        "end": end,
+                        "source": "rolling_direct",
+                        "slot_last_upd": point["last_updated"],
+                        "point_count": 1,
+                        "price": point["price"],
+                        "mcap": point["mcap"],
+                        "vol": point["vol"],
+                        "rank": point["rank"],
+                        "circ": point["circ"],
+                        "totl": point["totl"],
+                    }
+                )
+                continue
+
+            # Only a trustworthy existing row may reset the carry chain. Legacy rows
+            # used slot-end as last_updated and could otherwise extend a flatline forever.
+            if existing_point is not None and not source_is_weak(cast(str | None, existing_source)):
                 last_real_point = existing_point
                 carry_used = 0
+            elif existing_point is not None:
+                carry_used += 1
+                if carry_used >= ALLOW_CARRY_MAX_SLOTS:
+                    last_real_point = None
             entries.append({"kind": "existing", "start": start, "end": end})
             continue
 
-        point = slot_points.get(start)
         if point is not None:
-            source = "hist-in-slot"
+            source = "rolling_direct"
             carry_used = 0
             last_real_point = point
+            point_count = 1
         else:
             if last_real_point is None:
                 entries.append({"kind": "skip", "start": start, "end": end, "reason": "no-history"})
@@ -618,17 +675,20 @@ def plan_coin_slots(
             if carry_used >= ALLOW_CARRY_MAX_SLOTS:
                 entries.append({"kind": "skip", "start": start, "end": end, "reason": "carry-cap"})
                 continue
-            source = "hist-carry"
+            source = "rolling_carry"
             point = last_real_point
             carry_used += 1
+            point_count = 0
 
         entries.append(
             {
                 "kind": "insert",
+                "write_mode": "if_not_exists",
                 "start": start,
                 "end": end,
                 "source": source,
-                "slot_last_upd": end - timedelta(seconds=1),
+                "slot_last_upd": point["last_updated"],
+                "point_count": point_count,
                 "price": point["price"],
                 "mcap": point["mcap"],
                 "vol": point["vol"],
@@ -928,11 +988,32 @@ def main():
             totl = entry.get("totl")
             source = entry.get("source") or "hist-unknown"
             slot_last_upd = entry.get("slot_last_upd") or (end - timedelta(seconds=1))
+            point_count = int(entry.get("point_count") or 0)
+            write_mode = entry.get("write_mode") or "if_not_exists"
 
             try:
+                write_stmt = INS_10M_UPSERT_PS if write_mode == "upsert" else INS_10M_IF_NOT_EXISTS_PS
                 fut = session.execute_async(
-                    INS_10M_IF_NOT_EXISTS_PS,
-                    [coin_id, start, sym, name, price, mcap, vol, rank, circ, totl, slot_last_upd],
+                    write_stmt,
+                    [
+                        coin_id,
+                        start,
+                        sym,
+                        name,
+                        price,
+                        price,
+                        price,
+                        price,
+                        price,
+                        mcap,
+                        vol,
+                        rank,
+                        circ,
+                        totl,
+                        slot_last_upd,
+                        source,
+                        point_count,
+                    ],
                     timeout=REQUEST_TIMEOUT,
                 )
                 pending_writes.append(

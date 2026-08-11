@@ -3,6 +3,10 @@
 This folder is now the active runtime basis for the low-API-cost mode.
 The former paid-tier prod implementation has been moved to `backend/prices/potential_future`.
 
+AWS `lambda_handlers.py` still invokes the `prices.potential_future` DD/EE builders while mapping
+them onto the same legacy `gecko_*` tables. Daily/hourly quality safeguards therefore have to be
+kept aligned in both implementations; changing only the legacy workflow scripts is insufficient.
+
 ## Runtime behavior
 
 - Live ingestion basis: `AA_gck_load_prices_live.py` (top 1000 via `/coins/markets` pages).
@@ -10,8 +14,8 @@ The former paid-tier prod implementation has been moved to `backend/prices/poten
 - Hourly candles: `DD_gck_create_hourly_from_10m.py` (from 10m, no CoinGecko).
 - Daily candles: `EE_gck_create_daily_from_10m.py` (from 10m, no CoinGecko).
 - Monthly candles: `EG_gck_update_monthly_from_daily.py` (from daily/live, no CoinGecko).
-- True daily close API enrichment: `EF_gck_close_daily_topn_api.py` (default rank 1-300), once daily.
-- Continuity/raw backfill: `GF_gck_backfill_raw_flat.py` (local-only carry/derive fill across 10m/hourly/daily/monthly).
+- True daily close API enrichment: `EF_gck_close_daily_topn_api.py` (scheduled top 100, trailing seven-day catch-up; manual default rank 1-300).
+- Continuity/raw backfill: `GF_gck_backfill_raw_flat.py` (local-only derive/carry fill; synthetic daily carry is off by default).
 - Live recovery from raw: `GI_gck_refresh_live_from_raw.py` (rebuilds live-facing tables from freshest local raw rows, no CoinGecko).
 - API-key handling for all CoinGecko callers is centralized in `cg_key_pool.py` (AA/BB/CC/DD rotation + cooldown/suspension).
 
@@ -30,7 +34,7 @@ Active workflow set is intentionally small:
 - `gecko_legacy_core.yml`: main 10m cycle for AA + CC (live + 10m append).
 - `gecko_legacy_hourly.yml`: dedicated DD hourly build/finalize cadence.
 - `gecko_legacy_daily_partial.yml`: dedicated EE updates from 10m/live (frequent partial updates + nightly full finalize).
-- `gecko_legacy_daily_api_close.yml`: true daily API close (`EF_gck_close_daily_topn_api.py`) with rank window, inclusive day range, and optional coin-id filter.
+- `gecko_legacy_daily_api_close.yml`: scheduled true daily API close (`EF_gck_close_daily_topn_api.py`) for the top 100 and trailing seven days, plus manual rank/date overrides.
 - `gecko_legacy_maintenance.yml`: continuity-first daily maintenance for raw/live/aggregate recovery plus availability and audit checks. Precise API repair is disabled by default here.
 - `gecko_legacy_anchor_heal.yml`: stale-aware API healing for anchor assets (`bitcoin,ethereum,solana`) via `HE_gck_heal_anchor_if_stale.py`.
 - `gecko_legacy_manual_repair.yml`: manual rank/time-range intraday repair.
@@ -59,6 +63,7 @@ Legacy script IDs written to health tables:
 - `HH_recalculate_mcaps`
 - `audit_10m_gaps`
 - `audit_10m_aggregate_drift`
+- `audit_daily_ohlc_quality`
 - `GM_gck_manual_repair_intraday`
 - `HE_gck_heal_anchor_if_stale`
 
@@ -102,13 +107,27 @@ Original prod-era workflow files are archived (not active) at:
 ## Manual intraday repair
 
 Use `GM_gck_manual_repair_intraday.py` for on-demand 10m/hourly repairs by rank range and UTC time window.
-You can optionally narrow to explicit coin ids.
+The repair is credit-aware: it uses `gecko_prices_live_rolling` first, can interpolate short bounded
+rolling gaps, and only then falls back to CoinGecko. You can optionally narrow to explicit coin ids.
 
 Default safety behavior:
 
 - API repair is capped to ranks `1-100` unless `--allow-broad-ranks` is set.
-- 10m API repair auto-disables when the selected window exceeds `24h`.
+- Demo 10m API fallback requires a window strictly below `24h`; the default dynamic window is `23.5h`.
+- Explicit hourly requests work on Demo and cover up to `100d` per call, so a coin costs at most one
+  request for windows up to 100 days when `CG_CHUNK_HOURS=2400`.
+- `--api-call-budget` is a hard whole-run HTTP-attempt cap, including retries (default `25`). Historical endpoints are per coin and
+  cannot be batched across IDs; use the quality audit's suggested IDs or rank shards for larger repairs.
+- `--repair-source local-only` guarantees zero CoinGecko calls.
 - Existing `bf_*` carry/derived rows can be replaced with `--replace-derived`.
+- Existing flat/legacy rows require `--overwrite-existing`.
+- Overwrite runs preserve existing `manual_api*`/`hourly_api` rows, making retries credit-idempotent.
+  Use `--overwrite-authoritative` only when those API rows are known to be wrong.
+
+The normal append/rollup path also records 10m provenance (`rolling_direct` versus
+`rolling_carry`) and will not downgrade an API-repaired hourly row unless all expected 10m slots
+contain strong observations. The escape hatches are `UPGRADE_WEAK_EXISTING=0`,
+`PROTECT_API_REPAIRS=0`, and `MAX_WEAK_10M_RATIO_FOR_API_REPLACE` (default `0`).
 
 Local example:
 
@@ -118,11 +137,61 @@ PYTHONPATH=. python prices/prod_pipeline/GM_gck_manual_repair_intraday.py \
   --rank-start 1 \
   --rank-end 100 \
   --coin-ids bitcoin,ethereum \
-  --from-utc 2026-02-14T00:00:00Z \
-  --to-utc 2026-02-15T00:00:00Z \
-  --granularity both \
+  --lookback-hours 23.5 \
+  --granularity 10m \
+  --repair-source local-only \
+  --api-call-budget 0 \
+  --overwrite-existing \
+  --fail-on-unrepaired \
   --dry-run
 ```
+
+Hourly example (one seven-day request per affected coin, capped at 25 calls):
+
+```bash
+PYTHONPATH=. python prices/prod_pipeline/GM_gck_manual_repair_intraday.py \
+  --rank-start 1 \
+  --rank-end 100 \
+  --coin-ids <ids-from-audit> \
+  --lookback-hours 168 \
+  --granularity hourly \
+  --repair-source local-first \
+  --api-call-budget 25 \
+  --overwrite-existing \
+  --dry-run
+```
+
+Quality audit (read-only):
+
+```bash
+PYTHONPATH=. python prices/prod_pipeline/audit_intraday_quality.py \
+  --rank-start 1 --rank-end 100 --granularity both
+```
+
+Daily OHLC semantic audit (read-only):
+
+```bash
+PYTHONPATH=. python prices/prod_pipeline/audit_daily_ohlc_quality.py \
+  --rank-start 1 --rank-end 100 --lookback-days 365 --fail-on-definite
+```
+
+Daily API repair uses explicit hourly granularity and one request per coin for windows up to 100
+days. It requires at least two intraday observations per day, records `point_count`, and enforces a
+hard retry-inclusive attempt budget. For a historical quality-only pass that leaves market-cap and
+volume aggregates unchanged:
+
+```bash
+TOP_N_API_DAILY=100 RANK_START=1 RANK_END=100 \
+TARGET_START_DAY_ISO=2026-06-23 TARGET_END_DAY_ISO=2026-06-28 \
+CG_DAILY_INTERVAL=hourly API_ATTEMPT_BUDGET=120 \
+REPAIR_QUALITY_ONLY=1 PRESERVE_EXISTING_MARKET_FIELDS=1 REBUILD_MCAP_DAILY=0 \
+PYTHONPATH=. python prices/prod_pipeline/EF_gck_close_daily_topn_api.py
+```
+
+`EE_gck_create_daily_from_10m.py` now excludes carry/interpolated/stale intraday rows and requires
+72 strong 10m slots before writing a closed local day. `GG_gck_dq_repair_timeseries.py` scans for
+present-but-bad daily rows in addition to missing coverage, so stale synthetic rows no longer evade
+repair merely because their date exists.
 
 GitHub Actions manual dispatch:
 

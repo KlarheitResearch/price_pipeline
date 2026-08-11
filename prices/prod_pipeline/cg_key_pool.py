@@ -6,7 +6,7 @@ import time
 import zlib
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -330,6 +330,7 @@ def cg_http_get(
     timeout_sec: int = 45,
     hint: Optional[str] = None,
     key_pool: Optional[KeyPool] = None,
+    before_attempt: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
     pool = key_pool or build_key_pool()
     url = f"{base_url}{path}"
@@ -352,12 +353,14 @@ def cg_http_get(
         headers: dict[str, str] = {}
         if API_TIER == "demo":
             headers["x-cg-demo-api-key"] = key
-            req_params["x_cg_demo_api_key"] = key
         else:
             headers["x-cg-pro-api-key"] = key
-            req_params["x_cg_pro_api_key"] = key
 
         try:
+            # The hook runs immediately before every real HTTP attempt, including
+            # retries. Callers use it to enforce credit budgets accurately.
+            if before_attempt is not None:
+                before_attempt()
             resp = requests.get(url, params=req_params, headers=headers, timeout=timeout_sec)
             status_code = resp.status_code
             err_text = _extract_error_text(resp) if status_code >= 400 else ""

@@ -29,6 +29,8 @@ metrics = {
     "cg_calls_deferred": 0,
     "cg_calls_5xx": 0,
     "cg_calls_other_http": 0,
+    "cg_calls_daily": 0,
+    "cg_calls_hourly": 0,
     "points_daily": 0,
     "points_hourly": 0,
     "points_10m": 0,
@@ -71,13 +73,14 @@ def _mask_key(k: str | None) -> str:
     return f"<set:len={len(k)} last4={k[-4:]}>"
 
 def _abort_auth(where: str, e: AuthError):
+    safe_url = (e.url or "").split("?", 1)[0]
     print(
         f"[{_now_str()}] [FATAL] {where}: CoinGecko authentication/authorization failed\n"
         f"  status={e.status_code}\n"
         f"  tier={e.api_tier}\n"
         f"  auth_method={e.auth_method}\n"
         f"  key={e.key_fingerprint}\n"
-        f"  url={e.url}\n"
+        f"  url={safe_url}\n"
         f"  body_snippet={repr((e.body_snippet or '').strip())}\n"
         f"  hint: verify API_TIER matches your key type, BASE is correct, and the process has the right key.\n"
     )
@@ -93,14 +96,18 @@ def _throttle():
         sleep_for = 60.0 - (now - REQ_TIMES[0]) + 0.01
         time.sleep(max(0.0, sleep_for))
 
-def http_get(path, params=None):
+class ApiAttemptBudgetExceeded(RuntimeError):
+    pass
+
+
+def http_get(path, params=None, *, attempt_metric=None, attempt_limit=None):
     url = f"{BASE}{path}"; params = dict(params or {})
     headers = {}
     auth_method = "unknown"
     if API_TIER == "demo":
         if not API_KEY: raise RuntimeError("COINGECKO_API_KEY missing for demo tier.")
-        params["x_cg_demo_api_key"] = API_KEY
-        auth_method = "query_param:x_cg_demo_api_key"
+        headers["x-cg-demo-api-key"] = API_KEY
+        auth_method = "header:x-cg-demo-api-key"
     else:
         if not API_KEY: raise RuntimeError("COINGECKO_API_KEY missing for pro tier.")
         headers["x-cg-pro-api-key"] = API_KEY
@@ -108,6 +115,14 @@ def http_get(path, params=None):
 
     last = None
     for i in range(RETRIES):
+        if attempt_metric is not None:
+            limit = max(0, int(attempt_limit or 0))
+            if metrics[attempt_metric] >= limit:
+                raise ApiAttemptBudgetExceeded(
+                    f"CoinGecko API-attempt budget exhausted "
+                    f"({metrics[attempt_metric]}/{limit})"
+                )
+            metrics[attempt_metric] += 1
         _throttle()
         REQ_TIMES.append(time.time())
         metrics["cg_calls_total"] += 1
@@ -158,11 +173,21 @@ def http_get(path, params=None):
 # Goal: never forget high precision on chart endpoints.
 CG_VS_CURRENCY = os.getenv("CG_VS_CURRENCY", "usd").strip().lower()
 CG_PRECISION   = (os.getenv("CG_PRECISION", "full") or "full").strip().lower()  # "full" or "0".."18"
-CG_INTERVAL_DAILY  = (os.getenv("CG_INTERVAL_DAILY", "")  or "").strip().lower()   # "" (auto) | "daily"
-# IMPORTANT: passing interval=hourly is restricted on many plans; prefer auto by default.
-CG_INTERVAL_HOURLY = (os.getenv("CG_INTERVAL_HOURLY", "") or "").strip().lower()  # "" (auto) | "hourly"
+# Daily OHLC must be derived from intraday observations. Explicit hourly is
+# available on Demo for up to 100 days and avoids one-point daily buckets.
+CG_INTERVAL_DAILY  = (os.getenv("CG_INTERVAL_DAILY", "hourly") or "hourly").strip().lower()
+# Explicit hourly is available to Demo and all paid plans and avoids auto-granularity surprises.
+CG_INTERVAL_HOURLY = (os.getenv("CG_INTERVAL_HOURLY", "hourly") or "hourly").strip().lower()
 
-def cg_market_chart_range(coin_id: str, ts_from: int, ts_to: int, *, interval: str | None = None):
+def cg_market_chart_range(
+    coin_id: str,
+    ts_from: int,
+    ts_to: int,
+    *,
+    interval: str | None = None,
+    attempt_metric: str | None = None,
+    attempt_limit: int | None = None,
+):
     """
     Wrapper around /coins/{id}/market_chart/range that enforces our precision policy.
     """
@@ -172,21 +197,20 @@ def cg_market_chart_range(coin_id: str, ts_from: int, ts_to: int, *, interval: s
         "to": int(ts_to),
         "precision": CG_PRECISION,  # ✅ ensure full decimals (or configured)
     }
-    # Guard: avoid restricted interval=hourly unless you explicitly opted into it.
-    if interval == "hourly":
-        # If you really have Enterprise and want to force it, set CG_ALLOW_INTERVAL_HOURLY=1
-        allow = (os.getenv("CG_ALLOW_INTERVAL_HOURLY", "0").strip() == "1")
-        if not allow:
-            interval = None
-    # Many plans (incl demo) restrict explicit interval parameters.
-    # Prefer auto granularity unless explicitly allowed.
-    if interval:
+    # Hourly is supported on every keyed plan. Keep the explicit opt-in guard for
+    # other interval overrides, notably 5m which is still Enterprise-only.
+    if interval and interval != "hourly":
         allow = (os.getenv("CG_ALLOW_INTERVAL", "0").strip() == "1")
         if (str(API_TIER).lower() == "demo") and not allow:
             interval = None
     if interval:
         params["interval"] = interval
-    return http_get(f"/coins/{coin_id}/market_chart/range", params=params)
+    return http_get(
+        f"/coins/{coin_id}/market_chart/range",
+        params=params,
+        attempt_metric=attempt_metric,
+        attempt_limit=attempt_limit,
+    )
 
 def cg_preflight(needs_hourly: bool, needs_daily: bool):
     """
@@ -215,19 +239,29 @@ def cg_preflight(needs_hourly: bool, needs_daily: bool):
 
     try:
         if needs_hourly:
-            cg_market_chart_range(
-                test_coin,
-                now_s - 2 * 3600,
-                now_s,
-                interval=(CG_INTERVAL_HOURLY or None),
-            )
+            if HOURLY_API_REQ_BUDGET <= 0:
+                print(f"[{_now_str()}] Skipping hourly preflight: API-attempt budget is 0")
+            else:
+                cg_market_chart_range(
+                    test_coin,
+                    now_s - 2 * 3600,
+                    now_s,
+                    interval=(CG_INTERVAL_HOURLY or None),
+                    attempt_metric="cg_calls_hourly",
+                    attempt_limit=HOURLY_API_REQ_BUDGET,
+                )
         if needs_daily:
-            cg_market_chart_range(
-                test_coin,
-                now_s - 3 * 86400,
-                now_s,
-                interval=(CG_INTERVAL_DAILY or None),
-            )
+            if DAILY_API_REQ_BUDGET <= 0:
+                print(f"[{_now_str()}] Skipping daily preflight: API-attempt budget is 0")
+            else:
+                cg_market_chart_range(
+                    test_coin,
+                    now_s - 3 * 86400,
+                    now_s,
+                    interval=(CG_INTERVAL_DAILY or None),
+                    attempt_metric="cg_calls_daily",
+                    attempt_limit=DAILY_API_REQ_BUDGET,
+                )
     except AuthError as e:
         _abort_auth("preflight", e)
     except Exception as e:
@@ -247,7 +281,10 @@ def bucket_daily_ohlc(prices_ms_values, start_d: dt.date, end_d: dt.date):
         pts = sorted(per_day.get(d, []), key=lambda x: x[0])
         if pts:
             vals = [p for _,p in pts]
-            out[d] = {"open": vals[0], "high": max(vals), "low": min(vals), "close": vals[-1], "last_ts": pts[-1][0], "is_true_ohlc": len(vals)>1}
+            out[d] = {
+                "open": vals[0], "high": max(vals), "low": min(vals), "close": vals[-1],
+                "last_ts": pts[-1][0], "is_true_ohlc": len(vals) > 1, "point_count": len(vals),
+            }
         d += dt.timedelta(days=1)
     return out
 
@@ -472,6 +509,29 @@ def bad_hours_hourly(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
     return bad
 
 
+def bad_days_daily(coin_id: str, start_d: dt.date, end_d: dt.date) -> set[dt.date]:
+    """Return present-but-semantically-invalid daily rows that coverage misses."""
+    bad: set[dt.date] = set()
+    rows = exec_ps(SEL_DAILY_FOR_ID_RANGE_ALL, [coin_id, start_d, end_d])
+    for row in rows:
+        day = _to_pydate(getattr(row, "date", None))
+        source = (getattr(row, "candle_source", None) or "").strip().lower()
+        values = [getattr(row, name, None) for name in ("open", "high", "low", "close")]
+        last_updated = to_utc(getattr(row, "last_updated", None))
+        point_count = getattr(row, "point_count", None)
+
+        invalid = any(value is None for value in values)
+        if not invalid:
+            o, h, l, c = [float(value) for value in values]
+            invalid = h < max(o, c) or l > min(o, c) or h < l
+        stale = last_updated is not None and last_updated.date() < day
+        weak_source = any(token in source for token in ("carry", "interp", "partial"))
+        zero_points = point_count is not None and int(point_count) <= 0
+        if invalid or stale or weak_source or zero_points:
+            bad.add(day)
+    return bad
+
+
 # ---------- Equality ----------
 def _daily_row_equal(existing, o,h,l,c,mcap,vol,source):
     if not existing: return False
@@ -528,7 +588,7 @@ def repair_daily_from_10m(coin, missing_days: set[dt.date]) -> tuple[int, set[dt
                 o,h,l,c,c,
                 mcap, vol,
                 rnk, circ, tot,
-                "10m_final", last_upd
+                "10m_final", last_upd, len(prices)
             ))
         cnt += 1
         days_written.add(day)
@@ -580,7 +640,9 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
                 coin["id"],
                 int(sd.timestamp()),
                 int(ed.timestamp()),
-                interval=(CG_INTERVAL_DAILY or None),   # ✅ usually "daily"
+                interval=(CG_INTERVAL_DAILY or None),
+                attempt_metric="cg_calls_daily",
+                attempt_limit=DAILY_API_REQ_BUDGET,
             )
         except AuthError as e:
             _abort_auth("backfill_daily_from_api_ranges", e)
@@ -620,21 +682,17 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
     cur_rank, cur_circ, cur_tot = static_meta_for_coin(coin)
 
     batch = BatchStatement(consistency_level=ConsistencyLevel.QUORUM)
-    cnt_daily = 0; prev_close = None
+    cnt_daily = 0
     for d in days:
         row  = ohlc.get(d); mcap = m_series.get(d); vol = v_series.get(d)
-        if not row: continue
+        if not row or int(row.get("point_count") or 0) < 2:
+            continue
         o,h,l,c,last_ts = row["open"],row["high"],row["low"],row["close"],row["last_ts"]
-        if row.get("is_true_ohlc"): csrc = "hourly"
-        else:
-            if prev_close is None: o = h = l = c; csrc = "flat"
-            else:
-                o = float(prev_close); h = max(o,c); l = min(o,c); csrc = "prev_close"
-        day_end = day_bounds_utc(d)[1] - dt.timedelta(seconds=1)
+        csrc = "daily_api"
 
         existing = exec_ps(SEL_DAILY_ONE, [coin["id"], d]).one()
         if _daily_row_equal(existing, o,h,l,c,mcap,vol,csrc):
-            prev_close = c; continue
+            continue
 
         batch.add(INS_DAY, (
             coin["id"], d, coin["symbol"], coin["name"],
@@ -642,22 +700,29 @@ def backfill_daily_from_api_ranges(coin, need_daily: set[dt.date], dt_ranges: li
             float(mcap) if mcap is not None else None,
             float(vol)  if vol  is not None else None,
             cur_rank, cur_circ, cur_tot,
-            csrc, last_ts if row.get("is_true_ohlc") else day_end
+            csrc, last_ts,
+            int(row.get("point_count") or 1),
         ))
-        cnt_daily += 1; prev_close = c
+        cnt_daily += 1
         if (cnt_daily % 100 == 0): session.execute(batch); batch.clear()
     if len(batch): session.execute(batch)
     print(f"[{_now_str()}]    [api] {coin['symbol']} wrote={cnt_daily}")
     return cnt_daily
 
 def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.datetime):
-    step_s = 90 * 3600
+    step_s = max(1, HOURLY_API_CHUNK_HOURS) * 3600
     sd = ensure_utc_dt(start_dt, "start_dt")
     ed = ensure_utc_dt(end_dt, "end_dt")
     t0 = int(sd.timestamp()); t1 = int(ed.timestamp())
     prices_all, mcaps_all, vols_all = [], [], []
     cur = t0
     while cur < t1:
+        if metrics["cg_calls_hourly"] >= HOURLY_API_REQ_BUDGET:
+            print(
+                f"[{_now_str()}]  · hourly API budget exhausted "
+                f"({metrics['cg_calls_hourly']}/{HOURLY_API_REQ_BUDGET}); deferring remainder"
+            )
+            break
         nxt = min(cur + step_s, t1)
         try:
             data = cg_market_chart_range(
@@ -665,6 +730,8 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
                 cur,
                 nxt,
                 interval=(CG_INTERVAL_HOURLY or None),  # ✅ usually "hourly"
+                attempt_metric="cg_calls_hourly",
+                attempt_limit=HOURLY_API_REQ_BUDGET,
             )
             prices_all.extend(data.get("prices", []) or [])
             mcaps_all.extend(data.get("market_caps", []) or [])
@@ -676,6 +743,9 @@ def fetch_hourly_from_api(coin_id: str, start_dt: dt.datetime, end_dt: dt.dateti
             time.sleep(wait_s)
         except AuthError as e:
             _abort_auth("fetch_hourly_from_api", e)
+        except ApiAttemptBudgetExceeded as ex:
+            print(f"[{_now_str()}]  · {ex}; deferring remainder")
+            break
         except Exception as ex:
             print(f"[{_now_str()}]  · hourly chunk fetch failed: {ex}")
         time.sleep(PAUSE_S + random.uniform(0.0, 0.15))
@@ -1113,11 +1183,15 @@ def main():
             need_daily_all: set[dt.date] = set()
             need_daily_local: set[dt.date] = set()
             need_daily_api: set[dt.date] = set()
+            bad_daily_existing: set[dt.date] = set()
             missing_10m_days_full: set[dt.date] | None = None
 
             if RUNS_ANY_DAILY:
                 have_daily, _ = covered_days_from_ranges(coin["id"], start_daily_date, last_inclusive)
                 need_daily_all = want_daily_days - have_daily
+                if FILL_DAILY_BADSCAN:
+                    bad_daily_existing = bad_days_daily(coin["id"], start_daily_date, last_inclusive)
+                    need_daily_all |= bad_daily_existing
 
             # Read 10m coverage once for the widest needed window, then slice as needed
             if RUNS_ANY_DAILY or SEED_10M_FROM_DAILY:
@@ -1130,9 +1204,13 @@ def main():
                     d for d in (missing_10m_days_full or set())
                     if start_daily_date <= d <= last_inclusive
                 }
-                have_10m_on_day = need_daily_all - missing_10m_days_daily
+                # Existing bad daily rows go to the API even if synthetic 10m
+                # coverage exists; rebuilding from the same carry rows would
+                # simply recreate the corruption.
+                missing_daily = need_daily_all - bad_daily_existing
+                have_10m_on_day = missing_daily - missing_10m_days_daily
                 need_daily_local = have_10m_on_day
-                need_daily_api   = need_daily_all - need_daily_local
+                need_daily_api   = (missing_daily - need_daily_local) | bad_daily_existing
 
             # 10m seeding: days in 10m window with no 10m coverage
             need_10m: set[dt.date] = set()
@@ -1146,7 +1224,8 @@ def main():
                 print(f"[{_now_str()}]    Missing → 10m:{need_10m_label}")
             else:
                 print(f"[{_now_str()}]    Missing → 10m:{need_10m_label} "
-                    f"daily_total:{len(need_daily_all)} (10m_eligible:{len(need_daily_local)}, api:{len(need_daily_api)})")
+                    f"daily_total:{len(need_daily_all)} (bad_existing:{len(bad_daily_existing)}, "
+                    f"10m_eligible:{len(need_daily_local)}, api:{len(need_daily_api)})")
 
             # Local daily repair from 10m
             if need_daily_local and FIX_DAILY_FROM_10M and phase_enabled("daily_local"):

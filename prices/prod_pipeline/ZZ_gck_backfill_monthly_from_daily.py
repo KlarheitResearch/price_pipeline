@@ -18,6 +18,8 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SEC", "40"))
 PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "20"))
 VERBOSE = os.getenv("VERBOSE", "0") == "1"
 HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "15"))
+FROM_MONTH = (os.getenv("FROM_MONTH") or "").strip()
+TO_MONTH = (os.getenv("TO_MONTH") or FROM_MONTH).strip()
 
 KS = os.getenv("KEYSPACE", os.getenv("ASTRA_KEYSPACE", "default_keyspace")).strip()
 TABLE_DAILY = f"{KS}.gecko_candles_daily_contin"
@@ -35,6 +37,10 @@ def log(msg: str) -> None:
 
 def ym_tag(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
+
+
+def parse_month(value: str) -> date:
+    return datetime.strptime(value, "%Y-%m").date().replace(day=1)
 
 
 def month_bounds(d: date) -> Tuple[datetime, datetime]:
@@ -160,11 +166,26 @@ def main():
         f"SELECT id, symbol, name, market_cap_rank FROM {TABLE_LIVE}",
         fetch_size=FETCH_SIZE,
     )
-    sel_daily = session.prepare(
-        f"SELECT date, open, high, low, close, price_usd, volume_24h, market_cap, market_cap_rank, "
-        f"circulating_supply, total_supply, last_updated, symbol, name "
-        f"FROM {TABLE_DAILY} WHERE id=?"
-    )
+    bounded_months = bool(FROM_MONTH or TO_MONTH)
+    if bounded_months:
+        from_month = parse_month(FROM_MONTH or TO_MONTH)
+        to_month = parse_month(TO_MONTH or FROM_MONTH)
+        if to_month < from_month:
+            raise SystemExit("TO_MONTH must be >= FROM_MONTH")
+        _, daily_end = month_bounds(to_month)
+        sel_daily = session.prepare(
+            f"SELECT date, open, high, low, close, price_usd, volume_24h, market_cap, market_cap_rank, "
+            f"circulating_supply, total_supply, last_updated, symbol, name "
+            f"FROM {TABLE_DAILY} WHERE id=? AND date>=? AND date<?"
+        )
+        log(f"Bounded month repair: {ym_tag(from_month)}..{ym_tag(to_month)}")
+    else:
+        from_month = to_month = daily_end = None
+        sel_daily = session.prepare(
+            f"SELECT date, open, high, low, close, price_usd, volume_24h, market_cap, market_cap_rank, "
+            f"circulating_supply, total_supply, last_updated, symbol, name "
+            f"FROM {TABLE_DAILY} WHERE id=?"
+        )
     ins_monthly = session.prepare(
         f"INSERT INTO {TABLE_MONTHLY} "
         f"(id, year_month, symbol, name, open, high, low, close, volume, "
@@ -193,7 +214,8 @@ def main():
             log(f"→ Coin {idx}/{len(coins)}: {getattr(coin, 'symbol', '?')} ({getattr(coin, 'id', '?')})")
 
         try:
-            daily_rows = list(session.execute(sel_daily, [coin.id], timeout=REQUEST_TIMEOUT))
+            params = [coin.id, from_month, daily_end.date()] if bounded_months else [coin.id]
+            daily_rows = list(session.execute(sel_daily, params, timeout=REQUEST_TIMEOUT))
         except Exception as e:
             log(f"[READ-ERR] {coin.id}: {e}")
             continue

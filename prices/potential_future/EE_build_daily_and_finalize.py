@@ -31,7 +31,7 @@ from prices.potential_future.common import (
 
 REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "45"))
 SLOT_DELAY_SEC = int(os.getenv("PP_SLOT_DELAY_SEC", "90"))
-DAILY_FINALIZE_LOOKBACK_DAYS = int(os.getenv("PP_DAILY_FINALIZE_LOOKBACK_DAYS", "2"))
+DAILY_FINALIZE_LOOKBACK_DAYS = int(os.getenv("PP_DAILY_FINALIZE_LOOKBACK_DAYS", "7"))
 EE_API_MODE = (os.getenv("PP_EE_API_MODE", "missing_only") or "missing_only").strip().lower()
 if EE_API_MODE not in {"off", "missing_only", "always"}:
     EE_API_MODE = "missing_only"
@@ -68,13 +68,50 @@ def _source(existing_row) -> str:
     return (getattr(existing_row, "candle_source", None) or "").strip().lower() if existing_row is not None else ""
 
 
+def _authoritative_api_row(existing_row) -> bool:
+    src = _source(existing_row)
+    if src not in {"cg_daily_final", "api_daily_final", "daily_api"}:
+        return False
+    return _i(getattr(existing_row, "point_count", None), 0) >= 2
+
+
+def _daily_row_invalid(existing_row) -> bool:
+    if existing_row is None:
+        return True
+    values = [_f(getattr(existing_row, key, None)) for key in ("open", "high", "low", "close")]
+    if any(value is None for value in values):
+        return True
+    open_, high, low, close = values
+    if high < max(open_, close) or low > min(open_, close) or high < low:
+        return True
+    day_key = getattr(existing_row, "date", None)
+    last_updated = to_utc(getattr(existing_row, "last_updated", None))
+    if day_key is not None and last_updated is not None:
+        try:
+            expected_day = day_key if hasattr(day_key, "year") else None
+            if expected_day is None:
+                from datetime import date as _date
+                expected_day = _date.fromisoformat(str(day_key)[:10])
+            if last_updated.date() < expected_day:
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _weak_daily_source(src: str) -> bool:
+    return src in _DAILY_WEAK_SOURCES or any(token in src for token in ("carry", "interp", "partial"))
+
+
 def _needs_provisional_rebuild(existing_row) -> bool:
     if existing_row is None:
         return True
     src = _source(existing_row)
-    if src == "cg_daily_final":
+    if _authoritative_api_row(existing_row):
         return False
-    if src in _DAILY_WEAK_SOURCES:
+    if _daily_row_invalid(existing_row):
+        return True
+    if _weak_daily_source(src):
         return True
     pts = _i(getattr(existing_row, "point_count", None), 0)
     return pts < EE_MIN_POINTS_FOR_FINAL
@@ -86,11 +123,13 @@ def _needs_api_finalize(existing_row) -> bool:
     if existing_row is None:
         return True
     src = _source(existing_row)
-    if src == "cg_daily_final":
+    if _authoritative_api_row(existing_row):
         return False
+    if _daily_row_invalid(existing_row):
+        return True
     if EE_API_MODE == "always":
         return True
-    if src in _DAILY_WEAK_SOURCES:
+    if _weak_daily_source(src):
         return True
     pts = _i(getattr(existing_row, "point_count", None), 0)
     return pts < EE_MIN_POINTS_FOR_FINAL
@@ -104,7 +143,22 @@ def _pick_price_from_row(row):
     return None
 
 
+def _strong_10m_row(row) -> bool:
+    source = (getattr(row, "candle_source", None) or "").strip().lower()
+    if any(token in source for token in ("carry", "from_daily", "from_hourly", "interp")):
+        return False
+    points = getattr(row, "point_count", None)
+    if points is not None and _i(points, 0) <= 0:
+        return False
+    ts = to_utc(getattr(row, "ts", None))
+    last_updated = to_utc(getattr(row, "last_updated", None))
+    if ts is not None and last_updated is not None and last_updated < ts - timedelta(minutes=20):
+        return False
+    return _pick_price_from_row(row) is not None
+
+
 def build_day_from_10m(rows, day_start, day_end):
+    rows = [row for row in rows if _strong_10m_row(row)]
     if not rows:
         return None
     ordered = sorted(rows, key=lambda r: to_utc(getattr(r, "ts", None)) or day_start)
@@ -215,14 +269,15 @@ def main() -> None:
             SELECT ts, open, high, low, close, price_usd,
                    market_cap, volume_24h, market_cap_rank,
                    circulating_supply, total_supply,
-                   point_count, last_updated
+                   candle_source, point_count, last_updated
             FROM {TABLE_10M}
             WHERE id=? AND ts>=? AND ts<?
             """
         )
         sel_daily_one = session.prepare(
             f"""
-            SELECT candle_source, point_count, circulating_supply, total_supply
+            SELECT date, open, high, low, close, candle_source, point_count,
+                   circulating_supply, total_supply, last_updated
             FROM {TABLE_DAILY}
             WHERE id=? AND date=? LIMIT 1
             """
@@ -300,7 +355,7 @@ def main() -> None:
                 day_start = item["day_start"]
                 day_end = item["day_end"]
                 existing = item["existing"]
-                if _source(existing) == "cg_daily_final":
+                if _authoritative_api_row(existing):
                     # Keep finalized candle stable: never overwrite with 10m reconstruction.
                     continue
 
@@ -339,7 +394,13 @@ def main() -> None:
             if api_targets:
                 api_window_start = min(item["day_start"] for item in api_targets)
                 try:
-                    api_finalize_data = cg_market_chart_range(coin.id, api_window_start, today_start, vs_currency="usd")
+                    api_finalize_data = cg_market_chart_range(
+                        coin.id,
+                        api_window_start,
+                        today_start,
+                        vs_currency="usd",
+                        interval="hourly",
+                    )
                     api_calls += 1
                 except Exception as exc:
                     print(f"[{now_str()}] [warn] API finalize preload failed for {coin.id}: {exc}")
@@ -352,7 +413,7 @@ def main() -> None:
                     continue
 
                 prices = extract_series_in_window(api_finalize_data.get("prices", []) or [], day_start, day_end)
-                if not prices:
+                if len(prices) < 2:
                     continue
                 price_values = [v for _, v in prices]
                 open_price = price_values[0]

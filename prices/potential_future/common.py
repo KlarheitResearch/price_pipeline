@@ -801,10 +801,8 @@ def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional
 
         if API_TIER == "demo":
             headers["x-cg-demo-api-key"] = key
-            req_params["x_cg_demo_api_key"] = key
         else:
             headers["x-cg-pro-api-key"] = key
-            req_params["x_cg_pro_api_key"] = key
 
         try:
             resp = requests.get(url, params=req_params, headers=headers, timeout=CG_TIMEOUT_SEC)
@@ -836,20 +834,30 @@ def cg_get(path: str, params: Optional[dict[str, Any]] = None, *, hint: Optional
     raise RuntimeError(f"CoinGecko request failed: {path}; last_error={last_err}")
 
 
-def cg_market_chart_range(coin_id: str, start_ts: datetime, end_ts_exclusive: datetime, *, vs_currency: str = "usd") -> dict[str, Any]:
+def cg_market_chart_range(
+    coin_id: str,
+    start_ts: datetime,
+    end_ts_exclusive: datetime,
+    *,
+    vs_currency: str = "usd",
+    interval: str | None = None,
+) -> dict[str, Any]:
     start_ts = to_utc(start_ts)
     end_ts_exclusive = to_utc(end_ts_exclusive)
     to_ts = end_ts_exclusive - timedelta(seconds=1)
     if to_ts <= start_ts:
         to_ts = start_ts + timedelta(seconds=1)
+    params = {
+        "vs_currency": vs_currency,
+        "from": int(start_ts.timestamp()),
+        "to": int(to_ts.timestamp()),
+        "precision": "full",
+    }
+    if interval:
+        params["interval"] = interval
     return cg_get(
         f"/coins/{coin_id}/market_chart/range",
-        params={
-            "vs_currency": vs_currency,
-            "from": int(start_ts.timestamp()),
-            "to": int(to_ts.timestamp()),
-            "precision": "full",
-        },
+        params=params,
         hint=coin_id,
     )
 

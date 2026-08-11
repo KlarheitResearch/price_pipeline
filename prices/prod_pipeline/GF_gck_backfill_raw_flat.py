@@ -5,7 +5,8 @@ Probe and backfill raw Gecko datasets without touching aggregate tables.
 Strategy:
 - Fill missing 10m rows from existing hourly rows, else daily rows, else carry-forward.
 - Fill missing hourly rows from 10m rows, else daily rows, else carry-forward.
-- Fill missing daily rows from 10m rows, else hourly rows, else carry-forward.
+- Fill missing daily rows from observed 10m rows, else observed hourly rows.
+- Daily carry-forward is disabled unless explicitly requested.
 - Refresh touched monthly rows from daily rows for the affected months.
 
 The goal is continuity and explicit provenance, not authoritative API reconstruction.
@@ -149,6 +150,19 @@ def source_leaf(src: str | None) -> str | None:
     return text.replace(" ", "_")
 
 
+def row_is_observed_for_day(row: dict[str, Any], expected_day: date) -> bool:
+    source = (row.get("candle_source") or "").strip().lower()
+    if any(token in source for token in ("carry", "from_daily", "from_hourly", "interp")):
+        return False
+    point_count = int_or_none(row.get("point_count"))
+    if point_count is not None and point_count <= 0:
+        return False
+    last_updated = to_utc(cast(Optional[datetime], row.get("last_updated")))
+    if last_updated is not None and last_updated.date() < expected_day:
+        return False
+    return row_close(row) is not None
+
+
 def row_close(row: dict[str, Any]) -> Optional[float]:
     return (
         fnum(row.get("close"))
@@ -271,6 +285,11 @@ def main() -> None:
     parser.add_argument("--from-utc", type=str, required=True)
     parser.add_argument("--to-utc", type=str, required=True)
     parser.add_argument("--probe-only", action="store_true")
+    parser.add_argument(
+        "--allow-daily-carry",
+        action="store_true",
+        help="Allow synthetic open=high=low=close daily rows when no observed intraday data exists.",
+    )
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--progress-every", type=int, default=25)
     args = parser.parse_args()
@@ -290,7 +309,7 @@ def main() -> None:
         f"[{now_str()}] raw-backfill config "
         f"ranks={args.rank_start}-{args.rank_end} "
         f"range={start_utc.isoformat()} -> {end_utc.isoformat()} "
-        f"probe_only={args.probe_only}"
+        f"probe_only={args.probe_only} allow_daily_carry={args.allow_daily_carry}"
     )
 
     session, cluster = cast(tuple[Session, Cluster], get_session(return_cluster=True))
@@ -653,7 +672,11 @@ def main() -> None:
                 if d in daily_map:
                     continue
 
-                day_10m = [ten_map[slot] for slot in iter_10m(day_start(d), min(end_utc, day_start(d) + ONE_DAY)) if slot in ten_map]
+                day_10m = [
+                    ten_map[slot]
+                    for slot in iter_10m(day_start(d), min(end_utc, day_start(d) + ONE_DAY))
+                    if slot in ten_map and row_is_observed_for_day(ten_map[slot], d)
+                ]
                 if day_10m:
                     o, h, l, c = derive_ohlc_from_rows(day_10m)
                     last_row = day_10m[-1]
@@ -680,7 +703,11 @@ def main() -> None:
                         "point_count": len(day_10m),
                     }
                 else:
-                    day_hours = [hourly_map[hour] for hour in iter_hours(day_start(d), min(end_utc, day_start(d) + ONE_DAY)) if hour in hourly_map]
+                    day_hours = [
+                        hourly_map[hour]
+                        for hour in iter_hours(day_start(d), min(end_utc, day_start(d) + ONE_DAY))
+                        if hour in hourly_map and row_is_observed_for_day(hourly_map[hour], d)
+                    ]
                     if day_hours:
                         o, h, l, c = derive_ohlc_from_rows(day_hours)
                         last_row = day_hours[-1]
@@ -706,7 +733,7 @@ def main() -> None:
                             "candle_source": src_label,
                             "point_count": len(day_hours),
                         }
-                    else:
+                    elif args.allow_daily_carry:
                         prev_day_key = find_prev_key(daily_keys_sorted, d)
                         if prev_day_key is None:
                             continue
@@ -732,6 +759,8 @@ def main() -> None:
                             "candle_source": src_label,
                             "point_count": 1,
                         }
+                    else:
+                        continue
 
                 daily_map[d] = new_row
                 daily_keys_sorted.append(d)

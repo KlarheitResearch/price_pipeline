@@ -6,11 +6,9 @@ on:
       from_utc:
         description: "UTC start of outage window (YYYY-MM-DD or ISO timestamp)"
         required: true
-        default: "2026-06-22T20:00:00Z"
       to_utc:
         description: "UTC end of outage window (YYYY-MM-DD or ISO timestamp)"
         required: true
-        default: "2026-06-30T00:00:00Z"
       continuity_rank_start:
         description: "Continuity backfill rank start"
         required: false
@@ -23,6 +21,10 @@ on:
         description: "Precise API repair rank end"
         required: false
         default: "100"
+      precise_api_call_budget:
+        description: "Hard CoinGecko HTTP-attempt cap for each precise repair step"
+        required: false
+        default: "25"
       run_precise_hourly:
         description: "Use CoinGecko hourly repair for top ranks across outage window"
         type: choice
@@ -32,7 +34,7 @@ on:
           - "true"
           - "false"
       run_precise_10m_recent:
-        description: "Use CoinGecko 10m repair for top ranks over the most recent 24h slice"
+        description: "Repair top-rank 10m data over a recent 23h50m slice (rolling first)"
         type: choice
         required: true
         default: "true"
@@ -187,7 +189,7 @@ jobs:
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           REQUEST_TIMEOUT_SEC: "45"
           FETCH_SIZE: "500"
-          CG_CHUNK_HOURS: "72"
+          CG_CHUNK_HOURS: "2400"
           PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
         run: |
           python prices/prod_pipeline/pipeline_health_runner.py \
@@ -202,6 +204,8 @@ jobs:
               --to-utc "${{ github.event.inputs.to_utc }}" \
               --granularity hourly \
               --precise-rank-end "${{ github.event.inputs.precise_rank_end }}" \
+              --repair-source local-first \
+              --api-call-budget "${{ github.event.inputs.precise_api_call_budget }}" \
               --overwrite-existing
 
       - name: Precise 10m repair for recent 24h slice
@@ -212,14 +216,15 @@ jobs:
           COINGECKO_ALLOW_GENERIC_KEY_FALLBACK: "0"
           REQUEST_TIMEOUT_SEC: "45"
           FETCH_SIZE: "500"
-          CG_CHUNK_HOURS: "72"
+          CG_CHUNK_HOURS: "2400"
           PRECISE_RANK_END: ${{ github.event.inputs.precise_rank_end || '100' }}
-          AUTHORITATIVE_10M_MAX_HOURS: "24"
+          AUTHORITATIVE_10M_MAX_HOURS: "23.9"
         run: |
           set -euo pipefail
           TO_EPOCH="$(date -u -d "${{ github.event.inputs.to_utc }}" +%s)"
           FROM_EPOCH="$(date -u -d "${{ github.event.inputs.from_utc }}" +%s)"
-          TEN_FROM_EPOCH="$(( TO_EPOCH - 24*3600 ))"
+          # Stay strictly below CoinGecko's exact-24h hourly fallback boundary.
+          TEN_FROM_EPOCH="$(( TO_EPOCH - 23*3600 - 50*60 ))"
           if [ "${TEN_FROM_EPOCH}" -lt "${FROM_EPOCH}" ]; then
             TEN_FROM_EPOCH="${FROM_EPOCH}"
           fi
@@ -236,7 +241,9 @@ jobs:
             --from-utc "${TEN_FROM_UTC}" \
             --to-utc "${{ github.event.inputs.to_utc }}" \
             --granularity 10m \
-            --precise-rank-end "${{ github.event.inputs.precise_rank_end }}")
+            --precise-rank-end "${{ github.event.inputs.precise_rank_end }}" \
+            --repair-source local-first \
+            --api-call-budget "${{ github.event.inputs.precise_api_call_budget }}")
 
           if [ "${{ github.event.inputs.precise_replace_derived }}" = "true" ]; then
             CMD+=(--replace-derived)

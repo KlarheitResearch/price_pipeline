@@ -190,7 +190,8 @@ jobs:
           REQUEST_TIMEOUT_SEC: "45"
           CONNECT_TIMEOUT_SEC: "15"
           FETCH_SIZE: "500"
-          CG_CHUNK_HOURS: "72"
+          CG_CHUNK_HOURS: "2400"
+          API_CALL_BUDGET: "3"
 
           HEAL_FORCE: "${{ env.HEAL_FORCE_RESOLVED }}"
           HEAL_ANCHOR_IDS: "${{ env.HEAL_ANCHOR_IDS_RESOLVED }}"
